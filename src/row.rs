@@ -199,6 +199,7 @@ mod tests {
             lat,
             entity_type: crate::read::OSM_WAY,
             osm_id: 1,
+            tags: crate::tags::TagSpan::default(),
         }
     }
 
@@ -261,12 +262,14 @@ mod tests {
                 lat: 52.5,
                 entity_type: crate::read::OSM_NODE,
                 osm_id: 42,
+                tags: crate::tags::TagSpan::default(),
             }),
             key_feature(&Feature {
                 lon: 13.4,
                 lat: 52.5,
                 entity_type: crate::read::OSM_WAY,
                 osm_id: 42,
+                tags: crate::tags::TagSpan::default(),
             }),
         ];
         resolve_identities(&mut batch).expect("two keys fit");

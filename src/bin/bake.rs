@@ -24,7 +24,7 @@ fn main() {
     let (input, output) = (&args[1], &args[2]);
 
     let t0 = std::time::Instant::now();
-    let (features, stats) = match read::read_features(input) {
+    let (features, tag_store, stats) = match read::read_features(input) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("read failed: {e}");
@@ -32,6 +32,27 @@ fn main() {
         }
     };
     eprintln!("read in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // ── Resolve the tag codebooks, once, before anything is written. ──
+    //
+    // The bake does not yet WRITE tags into rows — `cluster` is the storage
+    // shape and its write path is the next step. Resolving here anyway is not
+    // ceremony: it is the only place the `u24` capacity bound is exercised, and
+    // it must fail before an output file exists rather than after.
+    let t_tags = std::time::Instant::now();
+    let tags = match tag_store.resolve() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tag codebook failed: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "tag codebooks resolved in {:.1}s (keys digest {:016x}, values digest {:016x})",
+        t_tags.elapsed().as_secs_f64(),
+        tags.keys.digest(),
+        tags.values.digest(),
+    );
 
     // ── Key, sort into trie order, number collisions. ──
     let t1 = std::time::Instant::now();
@@ -79,6 +100,9 @@ fn main() {
     println!("    via way           {:>12}", stats.restrictions_via_way);
     println!("    no via (centroid) {:>12}", stats.restrictions_no_via);
     println!("ways unresolved       {:>12}", stats.ways_unresolved);
+    println!("tag pairs             {:>12}", stats.tag_pairs);
+    println!("  distinct keys       {:>12}", stats.distinct_tag_keys);
+    println!("  distinct values     {:>12}", stats.distinct_tag_values);
     println!("ROWS                  {:>12}", keyed.len());
     println!(
         "bytes                 {:>12}  ({:.2} GiB at stride 512)",

@@ -241,6 +241,7 @@ mod tests {
             lat: berlin.1,
             entity_type: crate::read::OSM_NODE,
             osm_id: 1,
+            tags: crate::tags::TagSpan::default(),
         });
         let row = build_row(&k);
         let bytes = unsafe {

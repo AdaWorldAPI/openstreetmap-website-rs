@@ -5,11 +5,13 @@
 //!
 //! # What gets a row, and what does not
 //!
-//! Only tagged elements. Berlin's extract carries 7,870,234 nodes of which
-//! 1,190,010 are tagged — the other 85% are pure *geometry* (way node-refs,
-//! 10.4 M of them at 7.8 per way). Giving each a 512-byte ABI row would cost
-//! 4.7 GB to store what is, per the CANON node's own doctrine 2, bulk that is
-//! **addressed, not inlined**. Tagged features are 2,527,304 rows ≈ 1.2 GiB.
+//! Only tagged elements. Berlin's extract carries 7,852,192 nodes of which
+//! 1,185,287 are tagged — the other 85% are pure *geometry* (way node-refs).
+//! Giving each a 512-byte ABI row would cost 4.7 GB to store what is, per the
+//! CANON node's own doctrine 2, bulk that is **addressed, not inlined**.
+//! Tagged features are 2,518,465 (1,185,287 nodes + 1,315,767 ways + 17,411
+//! relations), carrying 11,679,125 tag pairs. Re-measured 2026-08-06; the
+//! earlier figures in this doc were from a different extract vintage.
 //!
 //! # Anchoring
 //!
@@ -35,6 +37,8 @@ use std::collections::HashMap;
 
 use ogar_vocab::class_ids;
 use osmpbf::{Element, ElementReader};
+
+use crate::tags::{TagSpan, TagStore};
 
 /// OGAR concept ids for the OSM element kinds — **pulled** from
 /// [`ogar_vocab::class_ids`], never restated.
@@ -68,9 +72,20 @@ fn is_restriction(t: Option<&str>) -> bool {
     t.is_some_and(|t| t.starts_with("restriction"))
 }
 
-/// One tagged OSM feature, reduced to what a row needs: an anchor point and a
-/// kind. Tag *content* is deliberately absent — it belongs to a ClassView /
-/// tag-identity lane, not to this struct (Q1 Tag-as-Class).
+/// One tagged OSM feature, reduced to what a row needs: an anchor point, a
+/// kind, and its tags.
+///
+/// The tags are a [`TagSpan`] into the read's [`TagStore`], not owned text —
+/// the struct stays `Copy` (the read loop relies on it) and the extract's 8.5 M
+/// tag pairs stay one flat allocation instead of 2.5 M small ones. See
+/// [`crate::tags`].
+///
+/// An earlier version of this struct carried no tags at all, on the reasoning
+/// that tag *content* belongs to a ClassView rather than to the reader. That
+/// was right about where tags are *read* and wrong about whether they are
+/// *carried*: dropping them at the reader put them out of reach of the bake
+/// entirely, so "identical data to OSM" could not be true no matter what the
+/// row layout did. The ClassView still owns the reading.
 #[derive(Debug, Clone, Copy)]
 pub struct Feature {
     pub lon: f64,
@@ -80,6 +95,8 @@ pub struct Feature {
     /// extract. It is NOT stored in the row (raw ids need 34 bits; the
     /// identity-quad codebook is the sanctioned home — lance-graph PR #902).
     pub osm_id: i64,
+    /// This feature's tags, as a span into the read's [`TagStore`].
+    pub tags: TagSpan,
 }
 
 /// Counts reported by a read, so a bake can state what it covered.
@@ -102,6 +119,13 @@ pub struct ReadStats {
     /// Restrictions carrying no `via` member; fell back to the member centroid.
     pub restrictions_no_via: u64,
     pub ways_unresolved: u64,
+    /// Tag pairs interned across every emitted feature.
+    pub tag_pairs: u64,
+    /// Distinct tag keys — the size of the key codebook.
+    pub distinct_tag_keys: u64,
+    /// Distinct tag values — the size of the value codebook, and the one that
+    /// has to clear the `u24` bound (see [`crate::tags`]).
+    pub distinct_tag_values: u64,
 }
 
 /// One relation member, reduced to what anchoring needs.
@@ -118,6 +142,9 @@ struct Member {
 struct RawRelation {
     restriction: bool,
     members: Vec<Member>,
+    /// Interned during the read pass, because the relation's own tag text is
+    /// only borrowable while the element is in scope — anchoring happens later.
+    tags: TagSpan,
 }
 
 /// An OSM element id → its resolved position. Nodes map to their own
@@ -184,9 +211,16 @@ fn anchor_relation(
     (c, AnchorVia::Absent)
 }
 
-/// Read every tagged feature from `path`, anchored.
-pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn std::error::Error>> {
+/// Read every tagged feature from `path`, anchored, with its tags interned.
+///
+/// The [`TagStore`] is returned alongside the features because a [`TagSpan`] is
+/// meaningless without it — handing back only the features would be handing
+/// back offsets into a dropped allocation.
+pub fn read_features(
+    path: &str,
+) -> Result<(Vec<Feature>, TagStore, ReadStats), Box<dyn std::error::Error>> {
     let mut stats = ReadStats::default();
+    let mut store = TagStore::default();
 
     // ── Pass 1: node id → (lon, lat). ──
     let mut coords: PosMap = HashMap::with_capacity(8_000_000);
@@ -210,21 +244,25 @@ pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn st
     ElementReader::from_path(path)?.for_each(|el| match el {
         Element::Node(n) => {
             if n.tags().next().is_some() {
+                let tags = store.push(n.tags());
                 out.push(Feature {
                     lon: n.lon(),
                     lat: n.lat(),
                     entity_type: OSM_NODE,
                     osm_id: n.id(),
+                    tags,
                 });
             }
         }
         Element::DenseNode(n) => {
             if n.tags().next().is_some() {
+                let tags = store.push(n.tags());
                 out.push(Feature {
                     lon: n.lon(),
                     lat: n.lat(),
                     entity_type: OSM_NODE,
                     osm_id: n.id(),
+                    tags,
                 });
             }
         }
@@ -250,11 +288,13 @@ pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn st
             let c = (slon / f64::from(cnt), slat / f64::from(cnt));
             way_centroid.insert(w.id(), c);
             if tagged {
+                let tags = store.push(w.tags());
                 out.push(Feature {
                     lon: c.0,
                     lat: c.1,
                     entity_type: OSM_WAY,
                     osm_id: w.id(),
+                    tags,
                 });
             }
         }
@@ -263,6 +303,7 @@ pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn st
                 return;
             }
             let restriction = is_restriction(r.tags().find(|(k, _)| *k == "type").map(|(_, v)| v));
+            let tags = store.push(r.tags());
             let members = r
                 .members()
                 .filter_map(|m| match m.member_type {
@@ -286,6 +327,7 @@ pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn st
                 RawRelation {
                     restriction,
                     members,
+                    tags,
                 },
             ));
         }
@@ -322,6 +364,7 @@ pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn st
                     lat,
                     entity_type: OSM_RELATION,
                     osm_id: *rid,
+                    tags: rel.tags,
                 });
             }
             None => stats.relations_unanchorable += 1,
@@ -340,7 +383,14 @@ pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn st
         stats.restrictions_no_via,
         stats.relations_unanchorable,
     );
-    Ok((out, stats))
+    stats.tag_pairs = store.pair_count() as u64;
+    stats.distinct_tag_keys = store.distinct_keys() as u64;
+    stats.distinct_tag_values = store.distinct_values() as u64;
+    eprintln!(
+        "tags: {} pairs, {} distinct keys, {} distinct values",
+        stats.tag_pairs, stats.distinct_tag_keys, stats.distinct_tag_values,
+    );
+    Ok((out, store, stats))
 }
 
 #[cfg(test)]
@@ -384,14 +434,24 @@ mod tests {
         Member { is_node, id, via }
     }
 
+    /// A relation fixture. Anchoring never reads tags, so an empty span keeps
+    /// these fixtures about geometry — which is the only thing they test.
+    fn rel(restriction: bool, members: Vec<Member>) -> RawRelation {
+        RawRelation {
+            restriction,
+            members,
+            tags: TagSpan::default(),
+        }
+    }
+
     #[test]
     fn via_node_anchors_at_the_junction_not_the_member_centroid() {
         // The load-bearing case: 93.4% of Berlin's restrictions take this path.
         let (c, w) = maps();
-        let rel = RawRelation {
-            restriction: true,
-            members: vec![m(false, 10, false), m(true, 1, true), m(false, 20, false)],
-        };
+        let rel = rel(
+            true,
+            vec![m(false, 10, false), m(true, 1, true), m(false, 20, false)],
+        );
         let (anchor, how) = anchor_relation(&rel, &c, &w);
         assert_eq!(how, AnchorVia::Node);
         assert_eq!(anchor, Some((13.40, 52.50)), "must be the via node exactly");
@@ -412,10 +472,7 @@ mod tests {
     #[test]
     fn via_way_anchors_at_that_ways_centroid() {
         let (c, w) = maps();
-        let rel = RawRelation {
-            restriction: true,
-            members: vec![m(false, 10, false), m(false, 20, true)],
-        };
+        let rel = rel(true, vec![m(false, 10, false), m(false, 20, true)]);
         let (anchor, how) = anchor_relation(&rel, &c, &w);
         assert_eq!(how, AnchorVia::Way);
         assert_eq!(anchor, Some((13.50, 52.60)));
@@ -424,10 +481,7 @@ mod tests {
     #[test]
     fn no_via_falls_back_to_a_genuine_member_centroid() {
         let (c, w) = maps();
-        let rel = RawRelation {
-            restriction: false,
-            members: vec![m(true, 1, false), m(true, 2, false)],
-        };
+        let rel = rel(false, vec![m(true, 1, false), m(true, 2, false)]);
         let (anchor, how) = anchor_relation(&rel, &c, &w);
         assert_eq!(how, AnchorVia::Absent);
         // A real average of two distinct members, not just the first one.
@@ -443,10 +497,10 @@ mod tests {
     fn an_unresolvable_via_falls_back_rather_than_failing() {
         // A via clipped out of the extract must not sink the whole relation.
         let (c, w) = maps();
-        let rel = RawRelation {
-            restriction: true,
-            members: vec![m(true, 999, true), m(true, 1, false), m(true, 2, false)],
-        };
+        let rel = rel(
+            true,
+            vec![m(true, 999, true), m(true, 1, false), m(true, 2, false)],
+        );
         let (anchor, how) = anchor_relation(&rel, &c, &w);
         assert_eq!(
             how,
@@ -466,23 +520,14 @@ mod tests {
         // route_master and friends: every member is another relation, filtered
         // out before this point, so the member list is empty. 689 of Berlin's
         // 18,128 tagged relations are this shape.
-        let empty = RawRelation {
-            restriction: false,
-            members: vec![],
-        };
+        let empty = rel(false, vec![]);
         assert_eq!(anchor_relation(&empty, &c, &w).0, None);
         // ...and members that exist but resolve to nothing.
-        let ghosts = RawRelation {
-            restriction: false,
-            members: vec![m(true, 777, false), m(false, 888, false)],
-        };
+        let ghosts = rel(false, vec![m(true, 777, false), m(false, 888, false)]);
         assert_eq!(anchor_relation(&ghosts, &c, &w).0, None);
         // Can-stay-silent paired with can-fire: an ordinary relation DOES
         // anchor, so `None` means something.
-        let ok = RawRelation {
-            restriction: false,
-            members: vec![m(true, 1, false)],
-        };
+        let ok = rel(false, vec![m(true, 1, false)]);
         assert!(anchor_relation(&ok, &c, &w).0.is_some());
     }
 
@@ -493,14 +538,8 @@ mod tests {
         // makes collecting members and resolving afterwards safe regardless of
         // element order in the file.
         let (c, w) = maps();
-        let first = RawRelation {
-            restriction: true,
-            members: vec![m(true, 1, true), m(false, 10, false)],
-        };
-        let last = RawRelation {
-            restriction: true,
-            members: vec![m(false, 10, false), m(true, 1, true)],
-        };
+        let first = rel(true, vec![m(true, 1, true), m(false, 10, false)]);
+        let last = rel(true, vec![m(false, 10, false), m(true, 1, true)]);
         assert_eq!(
             anchor_relation(&first, &c, &w),
             anchor_relation(&last, &c, &w)
