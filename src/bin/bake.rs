@@ -13,6 +13,7 @@
 
 use std::io::Write;
 
+use osm_soa_bake::codebook::{write_books, Books};
 use osm_soa_bake::{read, row, tms};
 
 fn main() {
@@ -61,11 +62,39 @@ fn main() {
     let continuations = row::expand_tag_overflow(&mut keyed);
     keyed.sort_unstable_by_key(row::sort_key);
     let collisions = row::assign_identities(&mut keyed);
+    let identities = match row::resolve_identities(&mut keyed) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("identity codebook failed: {e:?}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
         "keyed + sorted {} rows in {:.1}s",
         keyed.len(),
         t1.elapsed().as_secs_f64()
     );
+
+    // ── The codebooks, written FIRST. ──
+    //
+    // Order is deliberate: a slab without its books is unreadable, so the books
+    // must never be the thing that failed to appear. If the sidecar cannot be
+    // written the bake stops before any slab exists.
+    let books_path = format!("{output}.books");
+    {
+        let f = std::fs::File::create(&books_path).expect("create codebook sidecar");
+        let mut w = std::io::BufWriter::new(f);
+        write_books(
+            &mut w,
+            &Books {
+                identities,
+                tag_keys: tags.keys.clone(),
+                tag_values: tags.values.clone(),
+            },
+        )
+        .expect("write codebooks");
+        w.flush().expect("flush codebooks");
+    }
 
     // ── Emit. Streamed, so peak memory is the keyed vec, not the slab. ──
     let t2 = std::time::Instant::now();
@@ -91,6 +120,7 @@ fn main() {
     eprintln!("wrote in {:.1}s", t2.elapsed().as_secs_f64());
     println!("input                 {input}");
     println!("output                {output}");
+    println!("codebooks             {books_path}");
     println!("nodes indexed         {:>12}", stats.nodes_indexed);
     println!("tagged nodes          {:>12}", stats.tagged_nodes);
     println!("tagged ways           {:>12}", stats.tagged_ways);
