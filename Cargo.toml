@@ -21,11 +21,16 @@ license = "Apache-2.0"
 
 [dependencies]
 osmpbf = "0.3"
-lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", features = ["guid-v3-tail"] }
+# Upstream deps are sourced by GIT, never by path. A local *path* dep forces
+# Cargo to read the sibling manifest during RESOLUTION, so a clean checkout
+# without the siblings fails before any code is compiled. lance-graph's `helix`
+# crate documents the same decision and its cause (codex P2 on lance-graph
+# #460); this crate had the path form and the same latent breakage.
+lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph.git", branch = "main", features = ["guid-v3-tail"] }
 # The upstream geo surface: the minted concepts + the capability table this
 # crate registers against (`src/capability.rs`).
-ogar-osm = { path = "../OGAR/crates/ogar-osm" }
-ogar-vocab = { path = "../OGAR/crates/ogar-vocab" }
+ogar-osm = { git = "https://github.com/AdaWorldAPI/OGAR.git", branch = "main" }
+ogar-vocab = { git = "https://github.com/AdaWorldAPI/OGAR.git", branch = "main" }
 
 [[bin]]
 name = "bake"

@@ -164,6 +164,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "lance-graph-contract"
 version = "0.1.0"
+source = "git+https://github.com/AdaWorldAPI/lance-graph.git?branch=main#48f55911ffdc1914b0dca052224d97ef3b5cfa1d"
 dependencies = [
  "glob",
  "serde",
@@ -222,6 +223,7 @@ dependencies = [
 [[package]]
 name = "ogar-osm"
 version = "0.1.0"
+source = "git+https://github.com/AdaWorldAPI/OGAR.git?branch=main#919c2142f47b0734602118bd8c74366d0f266bae"
 dependencies = [
  "ogar-vocab",
 ]
@@ -229,6 +231,7 @@ dependencies = [
 [[package]]
 name = "ogar-vocab"
 version = "0.1.0"
+source = "git+https://github.com/AdaWorldAPI/OGAR.git?branch=main#919c2142f47b0734602118bd8c74366d0f266bae"
 
 [[package]]
 name = "once_cell"
