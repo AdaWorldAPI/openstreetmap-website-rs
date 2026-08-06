@@ -39,3 +39,7 @@ path = "src/bin/bake.rs"
 
 [profile.release]
 opt-level = 3
+
+[[bin]]
+name = "tier_probe"
+path = "src/bin/tier_probe.rs"

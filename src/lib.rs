@@ -16,4 +16,5 @@ pub mod read;
 pub mod row;
 pub mod slab;
 pub mod street;
+pub mod tags;
 pub mod tms;
