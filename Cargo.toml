@@ -43,3 +43,7 @@ opt-level = 3
 [[bin]]
 name = "tier_probe"
 path = "src/bin/tier_probe.rs"
+
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"

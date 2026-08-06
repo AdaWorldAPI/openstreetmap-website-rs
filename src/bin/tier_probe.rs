@@ -71,15 +71,11 @@ fn refcount_histogram(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Which nodes are tagged, and which carry `layer`.
     let mut tagged: HashMap<i64, bool> = HashMap::with_capacity(1_300_000);
     ElementReader::from_path(path)?.for_each(|el| match el {
-        Element::Node(n) => {
-            if n.tags().next().is_some() {
-                tagged.insert(n.id(), n.tags().any(|(k, _)| k == "layer"));
-            }
+        Element::Node(n) if n.tags().next().is_some() => {
+            tagged.insert(n.id(), n.tags().any(|(k, _)| k == "layer"));
         }
-        Element::DenseNode(n) => {
-            if n.tags().next().is_some() {
-                tagged.insert(n.id(), n.tags().any(|(k, _)| k == "layer"));
-            }
+        Element::DenseNode(n) if n.tags().next().is_some() => {
+            tagged.insert(n.id(), n.tags().any(|(k, _)| k == "layer"));
         }
         _ => {}
     })?;
