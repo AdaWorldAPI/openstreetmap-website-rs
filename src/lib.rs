@@ -9,4 +9,5 @@
 pub mod geodesy;
 pub mod read;
 pub mod row;
+pub mod slab;
 pub mod tms;
