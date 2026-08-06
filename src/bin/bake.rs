@@ -72,7 +72,12 @@ fn main() {
     println!("nodes indexed         {:>12}", stats.nodes_indexed);
     println!("tagged nodes          {:>12}", stats.tagged_nodes);
     println!("tagged ways           {:>12}", stats.tagged_ways);
-    println!("relations (skipped)   {:>12}", stats.relations_skipped);
+    println!("relations anchored    {:>12}", stats.relations_anchored);
+    println!("  unanchorable        {:>12}", stats.relations_unanchorable);
+    println!("  turn restrictions   {:>12}", stats.restrictions);
+    println!("    via node (exact)  {:>12}", stats.restrictions_via_node);
+    println!("    via way           {:>12}", stats.restrictions_via_way);
+    println!("    no via (centroid) {:>12}", stats.restrictions_no_via);
     println!("ways unresolved       {:>12}", stats.ways_unresolved);
     println!("ROWS                  {:>12}", keyed.len());
     println!(
