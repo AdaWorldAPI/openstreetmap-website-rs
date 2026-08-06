@@ -74,9 +74,18 @@ pub enum SlabError {
 
 impl<'a> RowSlab<'a> {
     /// Wrap a byte range. Validates stride and alignment; copies nothing.
+    ///
+    /// An **empty** range is always valid and is not alignment-checked: an
+    /// empty slice carries a *dangling* pointer (`0x1` for `u8`), so demanding
+    /// 64-byte alignment of it would reject the legitimate zero-row case —
+    /// an extract with no resolvable features, or an empty sub-range of a
+    /// fragment. [`rows`](Self::rows) handles it symmetrically.
     pub fn new(bytes: &'a [u8]) -> Result<Self, SlabError> {
         if !bytes.len().is_multiple_of(NODE_ROW_STRIDE) {
             return Err(SlabError::NotRowAligned { len: bytes.len() });
+        }
+        if bytes.is_empty() {
+            return Ok(Self { bytes });
         }
         let align = core::mem::align_of::<NodeRow>();
         if !(bytes.as_ptr() as usize).is_multiple_of(align) {
@@ -99,6 +108,12 @@ impl<'a> RowSlab<'a> {
     /// The rows, as rows. **This is the whole read path**: one cast.
     #[must_use]
     pub fn rows(&self) -> &'a [NodeRow] {
+        // The empty case returns without constructing a slice: an empty range
+        // carries a dangling pointer, and `from_raw_parts` requires a properly
+        // aligned pointer *even at length 0*. Passing `0x1` would be UB.
+        if self.bytes.is_empty() {
+            return &[];
+        }
         // SAFETY: `new` proved the length is a whole number of 512-byte rows
         // and the base meets `NodeRow`'s alignment. `NodeRow` is
         // `#[repr(C, align(64))]` with a compile-asserted 512-byte size and no
@@ -209,6 +224,29 @@ mod tests {
         // The cast lands on the same bytes the file holds — no copy, no decode.
         assert_eq!(s.rows().as_ptr() as usize, a.0.as_ptr() as usize);
         assert_eq!(s.morton_at(1), 2);
+    }
+
+    #[test]
+    fn an_empty_slab_is_valid_and_is_not_alignment_checked() {
+        // An empty slice's pointer is dangling (`0x1` for u8), so it is NOT
+        // 64-aligned. A naive alignment check rejects the legitimate zero-row
+        // case; and once accepted, `rows()` must not hand that dangling
+        // pointer to `from_raw_parts`, which demands alignment even at len 0.
+        let empty: &[u8] = &[];
+        assert_ne!(
+            (empty.as_ptr() as usize) % core::mem::align_of::<NodeRow>(),
+            0,
+            "precondition: an empty slice dangles rather than being aligned"
+        );
+        let s = RowSlab::new(empty).expect("an empty slab is valid");
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+        assert!(s.rows().is_empty());
+        // And a query over it answers empty rather than panicking.
+        assert!(s.tile_range(14, 8802, 5373).is_empty());
+        // The same via an empty Vec, which is how a zero-row file reads.
+        let v: Vec<u8> = Vec::new();
+        assert!(RowSlab::new(&v).is_ok());
     }
 
     #[test]
