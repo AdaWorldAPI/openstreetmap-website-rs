@@ -6,7 +6,9 @@
 # builds on a disk-constrained host, exactly like q2's `osint-bake`. No ndarray,
 # no lance, no datafusion: the ABI row is a byte layout, not an engine.
 #
-# Sibling layout expected (as in q2/geo): ../lance-graph next to this repo.
+# Sibling layout expected (as in q2/geo): ../lance-graph and ../OGAR next to
+# this repo. `ogar-osm` is a 2-node tree (itself + the dep-free `ogar-vocab`),
+# so the light closure holds.
 [package]
 name = "osm-soa-bake"
 version = "0.1.0"
@@ -20,6 +22,10 @@ license = "Apache-2.0"
 [dependencies]
 osmpbf = "0.3"
 lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", features = ["guid-v3-tail"] }
+# The upstream geo surface: the minted concepts + the capability table this
+# crate registers against (`src/capability.rs`).
+ogar-osm = { path = "../OGAR/crates/ogar-osm" }
+ogar-vocab = { path = "../OGAR/crates/ogar-vocab" }
 
 [[bin]]
 name = "bake"
