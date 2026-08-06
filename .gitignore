@@ -1,0 +1,7 @@
+# Build artifacts — never committed.
+/target/
+
+# Bake outputs. A 1.2 GiB row slab belongs in the object store (osm/ prefix in
+# the private bucket), not in git — the repo already carries ~169 MB of PBFs.
+*.soa
+*.soa.gz

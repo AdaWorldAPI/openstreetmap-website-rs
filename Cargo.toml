@@ -1,0 +1,29 @@
+# osm-soa-bake — OpenStreetMap PBF → V3 ABI SoA rows (512 B: key|edges|value).
+#
+# The substrate behind the cockpit `/osm` endpoint. Deliberately a LIGHT
+# dependency closure — `osmpbf` (the PBF reader) + the zero-dep
+# `lance-graph-contract` (NodeGuid / EdgeBlock / NodeRow / ValueTenant) — so it
+# builds on a disk-constrained host, exactly like q2's `osint-bake`. No ndarray,
+# no lance, no datafusion: the ABI row is a byte layout, not an engine.
+#
+# Sibling layout expected (as in q2/geo): ../lance-graph next to this repo.
+[package]
+name = "osm-soa-bake"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "OSM PBF → V3 SoA NodeRows, keyed by the Cesium-TMS HHTL cascade."
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+osmpbf = "0.3"
+lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", features = ["guid-v3-tail"] }
+
+[[bin]]
+name = "bake"
+path = "src/bin/bake.rs"
+
+[profile.release]
+opt-level = 3
