@@ -39,6 +39,7 @@ use ogar_vocab::class_ids;
 use osmpbf::{Element, ElementReader};
 
 use crate::tags::{TagSpan, TagStore};
+use crate::tms::{mean_cell, point_to_cell, TileXy};
 
 /// OGAR concept ids for the OSM element kinds — **pulled** from
 /// [`ogar_vocab::class_ids`], never restated.
@@ -72,6 +73,43 @@ fn is_restriction(t: Option<&str>) -> bool {
     t.is_some_and(|t| t.starts_with("restriction"))
 }
 
+/// Where a feature sits, and under WHICH contract.
+///
+/// The two are genuinely different claims and the type says so, rather than
+/// leaving a reader to infer it from the element kind:
+///
+/// - [`Anchor::Published`] — the coordinate OSM itself stores, on its 1e-7
+///   degree grid. Parity means reproducing that integer, exactly.
+/// - [`Anchor::Derived`] — an anchor this crate computed, already a z=32 grid
+///   cell. It is a grid point **by construction** (integer mean of member
+///   cells, `tms::mean_cell`), so parity means reproducing that cell, exactly —
+///   and the derivation contains no float.
+///
+/// The first version had only `lon: f64, lat: f64` for both, which forced the
+/// derived case to be checked against OSM's grid — the wrong grid for a value
+/// that was never an OSM coordinate — and could only ever hold "within one
+/// step" (435,426 of 1,333,178 differed). Splitting the type is what lets both
+/// checks be `assert_eq!`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Anchor {
+    /// A node's own published coordinate.
+    Published { lon: f64, lat: f64 },
+    /// A way or relation anchor, computed in the key's own grid.
+    Derived(TileXy),
+}
+
+impl Anchor {
+    /// The cell this anchor keys to. Integer for [`Anchor::Derived`]; the one
+    /// ingest float for [`Anchor::Published`].
+    #[must_use]
+    pub fn cell(self) -> TileXy {
+        match self {
+            Anchor::Published { lon, lat } => point_to_cell(lon, lat),
+            Anchor::Derived(c) => c,
+        }
+    }
+}
+
 /// One tagged OSM feature, reduced to what a row needs: an anchor point, a
 /// kind, and its tags.
 ///
@@ -88,8 +126,7 @@ fn is_restriction(t: Option<&str>) -> bool {
 /// row layout did. The ClassView still owns the reading.
 #[derive(Debug, Clone, Copy)]
 pub struct Feature {
-    pub lon: f64,
-    pub lat: f64,
+    pub anchor: Anchor,
     pub entity_type: u16,
     /// The source OSM id, kept only so a bake can be audited back to the
     /// extract. It is NOT stored in the row (raw ids need 34 bits; the
@@ -147,9 +184,12 @@ struct RawRelation {
     tags: TagSpan,
 }
 
-/// An OSM element id → its resolved position. Nodes map to their own
-/// coordinate; ways to their centroid.
-type PosMap = HashMap<i64, (f64, f64)>;
+/// An OSM element id → its resolved **cell**. Nodes map to their own cell;
+/// ways to their integer centroid.
+///
+/// Cells, not coordinates: every downstream use is an anchor, and keeping the
+/// f64 here is what made the derived anchor float-dependent in the first place.
+type PosMap = HashMap<i64, TileXy>;
 
 /// Which branch of the anchor rule fired — reported so the bake shows the
 /// population rather than asserting it.
@@ -164,7 +204,7 @@ enum AnchorVia {
 }
 
 /// A member's position: a node's own coordinate, or a way's centroid.
-fn member_pos(m: &Member, coords: &PosMap, ways: &PosMap) -> Option<(f64, f64)> {
+fn member_pos(m: &Member, coords: &PosMap, ways: &PosMap) -> Option<TileXy> {
     if m.is_node {
         coords.get(&m.id).copied()
     } else {
@@ -188,7 +228,7 @@ fn anchor_relation(
     rel: &RawRelation,
     coords: &PosMap,
     ways: &PosMap,
-) -> (Option<(f64, f64)>, AnchorVia) {
+) -> (Option<TileXy>, AnchorVia) {
     if let Some(via) = rel.members.iter().find(|m| m.via) {
         if let Some(p) = member_pos(via, coords, ways) {
             let how = if via.is_node {
@@ -199,16 +239,12 @@ fn anchor_relation(
             return (Some(p), how);
         }
     }
-    let (mut slon, mut slat, mut cnt) = (0.0f64, 0.0f64, 0u32);
-    for m in &rel.members {
-        if let Some((lon, lat)) = member_pos(m, coords, ways) {
-            slon += lon;
-            slat += lat;
-            cnt += 1;
-        }
-    }
-    let c = (cnt > 0).then(|| (slon / f64::from(cnt), slat / f64::from(cnt)));
-    (c, AnchorVia::Absent)
+    let cells: Vec<TileXy> = rel
+        .members
+        .iter()
+        .filter_map(|m| member_pos(m, coords, ways))
+        .collect();
+    (mean_cell(&cells), AnchorVia::Absent)
 }
 
 /// Read every tagged feature from `path`, anchored, with its tags interned.
@@ -226,10 +262,10 @@ pub fn read_features(
     let mut coords: PosMap = HashMap::with_capacity(8_000_000);
     ElementReader::from_path(path)?.for_each(|el| match el {
         Element::Node(n) => {
-            coords.insert(n.id(), (n.lon(), n.lat()));
+            coords.insert(n.id(), point_to_cell(n.lon(), n.lat()));
         }
         Element::DenseNode(n) => {
-            coords.insert(n.id(), (n.lon(), n.lat()));
+            coords.insert(n.id(), point_to_cell(n.lon(), n.lat()));
         }
         _ => {}
     })?;
@@ -246,8 +282,10 @@ pub fn read_features(
             if n.tags().next().is_some() {
                 let tags = store.push(n.tags());
                 out.push(Feature {
-                    lon: n.lon(),
-                    lat: n.lat(),
+                    anchor: Anchor::Published {
+                        lon: n.lon(),
+                        lat: n.lat(),
+                    },
                     entity_type: OSM_NODE,
                     osm_id: n.id(),
                     tags,
@@ -258,8 +296,10 @@ pub fn read_features(
             if n.tags().next().is_some() {
                 let tags = store.push(n.tags());
                 out.push(Feature {
-                    lon: n.lon(),
-                    lat: n.lat(),
+                    anchor: Anchor::Published {
+                        lon: n.lon(),
+                        lat: n.lat(),
+                    },
                     entity_type: OSM_NODE,
                     osm_id: n.id(),
                     tags,
@@ -270,28 +310,19 @@ pub fn read_features(
             // Centroid is computed for EVERY way, tagged or not: a relation may
             // reference an untagged way (a multipolygon inner ring, a via way),
             // and that member still has to resolve.
-            let (mut slon, mut slat, mut cnt) = (0.0f64, 0.0f64, 0u32);
-            for id in w.refs() {
-                if let Some(&(lon, lat)) = coords.get(&id) {
-                    slon += lon;
-                    slat += lat;
-                    cnt += 1;
-                }
-            }
+            let cells: Vec<TileXy> = w.refs().filter_map(|id| coords.get(&id).copied()).collect();
             let tagged = w.tags().next().is_some();
-            if cnt == 0 {
+            let Some(c) = mean_cell(&cells) else {
                 if tagged {
                     ways_unresolved += 1;
                 }
                 return;
-            }
-            let c = (slon / f64::from(cnt), slat / f64::from(cnt));
+            };
             way_centroid.insert(w.id(), c);
             if tagged {
                 let tags = store.push(w.tags());
                 out.push(Feature {
-                    lon: c.0,
-                    lat: c.1,
+                    anchor: Anchor::Derived(c),
                     entity_type: OSM_WAY,
                     osm_id: w.id(),
                     tags,
@@ -354,14 +385,13 @@ pub fn read_features(
             }
         }
         match anchor {
-            Some((lon, lat)) => {
+            Some(cell) => {
                 stats.relations_anchored += 1;
                 if rel.restriction {
                     stats.restrictions += 1;
                 }
                 out.push(Feature {
-                    lon,
-                    lat,
+                    anchor: Anchor::Derived(cell),
                     entity_type: OSM_RELATION,
                     osm_id: *rid,
                     tags: rel.tags,
@@ -425,8 +455,9 @@ mod tests {
         // `via_node_anchors_at_the_junction_not_the_member_centroid` could not
         // fail no matter what the code did. The `assert_ne!` caught it. Keep
         // these asymmetric or that test goes vacuous.
-        let coords = HashMap::from([(1i64, (13.40, 52.50)), (2i64, (13.60, 52.70))]);
-        let ways = HashMap::from([(10i64, (13.32, 52.44)), (20i64, (13.50, 52.60))]);
+        let cell = |lon, lat| point_to_cell(lon, lat);
+        let coords = HashMap::from([(1i64, cell(13.40, 52.50)), (2i64, cell(13.60, 52.70))]);
+        let ways = HashMap::from([(10i64, cell(13.32, 52.44)), (20i64, cell(13.50, 52.60))]);
         (coords, ways)
     }
 
@@ -454,19 +485,24 @@ mod tests {
         );
         let (anchor, how) = anchor_relation(&rel, &c, &w);
         assert_eq!(how, AnchorVia::Node);
-        assert_eq!(anchor, Some((13.40, 52.50)), "must be the via node exactly");
+        assert_eq!(
+            anchor,
+            Some(point_to_cell(13.40, 52.50)),
+            "must be the via node exactly"
+        );
         // Two-sided: it must NOT be the centroid of from/via/to, which is where
         // a naive implementation would put it.
-        let centroid = ((13.32 + 13.40 + 13.50) / 3.0, (52.44 + 52.50 + 52.60) / 3.0);
+        let centroid = mean_cell(&[
+            point_to_cell(13.32, 52.44),
+            point_to_cell(13.40, 52.50),
+            point_to_cell(13.50, 52.60),
+        ]);
         assert_ne!(
-            centroid.0, 13.40,
+            centroid,
+            Some(point_to_cell(13.40, 52.50)),
             "fixture must not be symmetric about the via"
         );
-        assert_ne!(
-            anchor,
-            Some(centroid),
-            "a centroid anchor would be wrong here"
-        );
+        assert_ne!(anchor, centroid, "a centroid anchor would be wrong here");
     }
 
     #[test]
@@ -475,7 +511,7 @@ mod tests {
         let rel = rel(true, vec![m(false, 10, false), m(false, 20, true)]);
         let (anchor, how) = anchor_relation(&rel, &c, &w);
         assert_eq!(how, AnchorVia::Way);
-        assert_eq!(anchor, Some((13.50, 52.60)));
+        assert_eq!(anchor, Some(point_to_cell(13.50, 52.60)));
     }
 
     #[test]
@@ -484,12 +520,26 @@ mod tests {
         let rel = rel(false, vec![m(true, 1, false), m(true, 2, false)]);
         let (anchor, how) = anchor_relation(&rel, &c, &w);
         assert_eq!(how, AnchorVia::Absent);
-        // A real average of two distinct members, not just the first one.
-        assert_eq!(anchor, Some((13.50, 52.60)));
+        // A real average of two distinct members, not just the first one — and
+        // the average is taken in CELL space, which is what makes the anchor a
+        // grid point by construction.
+        let want = mean_cell(&[point_to_cell(13.40, 52.50), point_to_cell(13.60, 52.70)]);
+        assert_eq!(anchor, want);
         assert_ne!(
             anchor,
-            Some((13.40, 52.50)),
+            Some(point_to_cell(13.40, 52.50)),
             "must not collapse to member 0"
+        );
+        // Worth pinning explicitly: the cell-space mean is NOT the cell of the
+        // lon/lat midpoint. Mercator's y is non-linear in latitude, so the mean
+        // of projections is not the projection of the mean. Over this fixture's
+        // deliberately wide 0.2° span the two differ; over a real feature's
+        // extent they converge (Mercator is conformal, so cells are locally
+        // isotropic). `tier_probe` measures the real distribution.
+        assert_ne!(
+            anchor,
+            Some(point_to_cell(13.50, 52.60)),
+            "cell-space mean differs from the coordinate midpoint at this span"
         );
     }
 
@@ -509,8 +559,8 @@ mod tests {
         );
         assert_eq!(
             anchor,
-            Some((13.50, 52.60)),
-            "still anchored, via the centroid"
+            mean_cell(&[point_to_cell(13.40, 52.50), point_to_cell(13.60, 52.70)]),
+            "still anchored, via the cell-space centroid"
         );
     }
 

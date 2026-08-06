@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use osm_soa_bake::{read, tms};
+use osm_soa_bake::{geodesy, read, tms};
 use osmpbf::{Element, ElementReader};
 
 /// The cluster row's facet-slot budget (`ROW_SLOTS - RESERVED_SLOTS`).
@@ -159,11 +159,103 @@ fn refcount_histogram(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// **The anchor-shift probe** — how far does deriving in cell space move a
+/// real way's anchor?
+///
+/// Derived anchors used to be the f64 mean of member `(lon, lat)`; they are now
+/// the integer mean of member **cells** (`tms::mean_cell`), which is what makes
+/// them grid points by construction and removes the float from the derivation.
+///
+/// The two are not the same point. Mercator's `y` is non-linear in latitude, so
+/// the mean of projections is not the projection of the mean, and the gap grows
+/// with a feature's north-south extent. Mercator is conformal — cells are
+/// locally isotropic — so the gap should be negligible at feature scale, but
+/// "should be" is not a measurement. This is the measurement.
+///
+/// Reported as a distribution in metres, not a mean: an anchor is a tile
+/// address, and what matters is whether the tail ever moves a feature out of
+/// the tile a consumer would look in.
+fn anchor_shift(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut coords: HashMap<i64, (f64, f64)> = HashMap::with_capacity(8_000_000);
+    ElementReader::from_path(path)?.for_each(|el| match el {
+        Element::Node(n) => {
+            coords.insert(n.id(), (n.lon(), n.lat()));
+        }
+        Element::DenseNode(n) => {
+            coords.insert(n.id(), (n.lon(), n.lat()));
+        }
+        _ => {}
+    })?;
+
+    let mut shifts: Vec<f64> = Vec::with_capacity(1_400_000);
+    ElementReader::from_path(path)?.for_each(|el| {
+        if let Element::Way(w) = el {
+            if w.tags().next().is_none() {
+                return;
+            }
+            let pts: Vec<(f64, f64)> = w.refs().filter_map(|id| coords.get(&id).copied()).collect();
+            if pts.is_empty() {
+                return;
+            }
+            // The old anchor: f64 mean of coordinates.
+            let n = pts.len() as f64;
+            let old = (
+                pts.iter().map(|p| p.0).sum::<f64>() / n,
+                pts.iter().map(|p| p.1).sum::<f64>() / n,
+            );
+            // The new anchor: integer mean of cells, read back as a coordinate
+            // so the two are comparable in metres.
+            let cells: Vec<tms::TileXy> = pts
+                .iter()
+                .map(|&(lon, lat)| tms::point_to_cell(lon, lat))
+                .collect();
+            let Some(c) = tms::mean_cell(&cells) else {
+                return;
+            };
+            let new = tms::tile_to_lonlat(c.x, c.y_xyz);
+            shifts.push(geodesy::segment_metres(old.0, old.1, new.0, new.1));
+        }
+    })?;
+
+    shifts.sort_by(f64::total_cmp);
+    let pick = |p: f64| -> f64 {
+        if shifts.is_empty() {
+            return 0.0;
+        }
+        shifts[((shifts.len() - 1) as f64 * p).round() as usize]
+    };
+    println!("── anchor shift: cell-space mean vs coordinate mean ──");
+    println!("tagged ways measured  {:>12}", shifts.len());
+    println!("median                {:>12.3} m", pick(0.5));
+    println!("p95                   {:>12.3} m", pick(0.95));
+    println!("p99                   {:>12.3} m", pick(0.99));
+    println!(
+        "max                   {:>12.3} m",
+        shifts.last().copied().unwrap_or(0.0)
+    );
+    // A z=24 cell is 0.27–1.69 m (tms.rs); a z=32 cell is ~1.13 mm. Report how
+    // many ways move further than a z=24 cell — i.e. far enough to matter to a
+    // consumer reading at that tier.
+    let past_z24 = shifts.iter().filter(|&&m| m > 1.69).count();
+    println!(
+        "beyond one z=24 cell  {:>12}  ({:.3}%)",
+        past_z24,
+        100.0 * past_z24 as f64 / shifts.len().max(1) as f64
+    );
+    println!();
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: tier_probe <input.osm.pbf>");
         std::process::exit(2);
+    }
+
+    if let Err(e) = anchor_shift(&args[1]) {
+        eprintln!("anchor-shift probe failed: {e}");
+        std::process::exit(1);
     }
 
     if let Err(e) = refcount_histogram(&args[1]) {
@@ -182,12 +274,7 @@ fn main() {
     // (morton, tag_count) per feature — everything the probe needs.
     let coded: Vec<(u64, u64)> = features
         .iter()
-        .map(|f| {
-            (
-                tms::point_to_tms_morton(f.lon, f.lat),
-                u64::from(f.tags.len),
-            )
-        })
+        .map(|f| (tms::cell_to_morton(f.anchor.cell()), u64::from(f.tags.len)))
         .collect();
     drop(features);
 

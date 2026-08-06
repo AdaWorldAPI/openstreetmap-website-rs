@@ -31,18 +31,26 @@
 //! So the second mode is the real one. It reads rows from the slab and books
 //! from the sidecar and reconstructs elements from those bytes alone.
 //!
-//! # Two different position claims, deliberately separated
+//! # Two position contracts, both now exact
 //!
-//! - A **node** has a position OSM itself stores, on the 1e-7 degree grid. For
-//!   a node, "position parity" means the bake hands back *that integer* — a
-//!   claim about OSM's data.
-//! - A **way** or **relation** has no stored position; this crate *derives* an
-//!   anchor (centroid, or the `via` member). For those, the same check is a
-//!   round-trip of our own derived value — a claim about the key, not about
-//!   OSM.
+//! - **Published** (a node) — the coordinate OSM itself stores, on its 1e-7
+//!   degree grid. Parity means handing back *that integer*.
+//! - **Derived** (a way or relation) — an anchor this crate computed. It is a
+//!   z=32 grid cell **by construction** (`tms::mean_cell`, integer mean of
+//!   member cells under a fixed rounding rule), so parity means handing back
+//!   *that cell*.
 //!
-//! Reporting them merged would let the 52% that are derived carry the 48% that
-//! are not, so they are counted apart.
+//! Both are `assert_eq!` on integers. The derived one used to be "within one
+//! grid step", because the anchor was an f64 centroid compared against OSM's
+//! 1e-7 grid — the wrong grid for a value that was never an OSM coordinate.
+//! Deriving in the key's own grid removed the tolerance and, more importantly,
+//! removed the float: the derivation is now deterministic across platforms with
+//! no transcendental kernel to certify. The one remaining float is the ingest
+//! step (`merc_y`, once per published coordinate), which belongs to the first
+//! contract.
+//!
+//! They stay counted apart because they are different claims — one about OSM's
+//! data, one about this crate's own derivation.
 //!
 //! # This verdict is not vacuous — it failed twice before it passed
 //!
@@ -56,7 +64,8 @@
 //!    (`row::sort_key`), which also makes two bakes of one extract
 //!    byte-identical.
 //! 2. **435,426 derived-position mismatches.** Not a defect — a wrong
-//!    criterion. See the comment at the derived-position branch below.
+//!    criterion, and the measurement that motivated deriving anchors natively
+//!    in the key's grid. Both halves are exact now.
 //!
 //! Neither was reachable from a unit test: the first needs enough features at
 //! one Morton code for the sort to actually reorder, the second needs anchors
@@ -68,13 +77,13 @@ use std::collections::HashMap;
 use lance_graph_contract::canonical_node::{EdgeBlock, NodeGuid, NodeRow, TailVariant};
 use osm_soa_bake::codebook::read_books;
 
-/// One element as the extract states it: position on OSM's grid, plus its tags
-/// in ordinal space.
-type Truth = (i32, i32, Vec<(u32, u32)>);
+/// One element as the extract states it: its anchor under whichever contract
+/// applies, plus its tags in ordinal space.
+type Truth = (Anchor, Vec<(u32, u32)>);
 
 use osm_soa_bake::cluster::{self, Facet};
 use osm_soa_bake::identity::read_identity;
-use osm_soa_bake::read::{self, OSM_NODE};
+use osm_soa_bake::read::{self, Anchor};
 use osm_soa_bake::row::{self, Keyed};
 use osm_soa_bake::tms;
 
@@ -114,6 +123,10 @@ fn load_rows(path: &str) -> Vec<NodeRow> {
 #[derive(Default)]
 struct Recovered {
     kind: u16,
+    /// The cell the key names — recovered by integer de-interleave, exact.
+    cell: tms::TileXy,
+    /// The OSM grid point that cell snaps to. Only meaningful for a published
+    /// anchor; see the two contracts in the module doc.
     lon_e7: i32,
     lat_e7: i32,
     tags: Vec<(u32, u32)>,
@@ -139,13 +152,9 @@ fn main() {
     // Ground truth keyed by the same (kind, osm_id) the bake identifies by.
     let mut truth: HashMap<(u16, i64), Truth> = HashMap::with_capacity(features.len());
     for f in &features {
-        let expect = (
-            (f.lon * tms::OSM_GRID_PER_DEGREE).round() as i32,
-            (f.lat * tms::OSM_GRID_PER_DEGREE).round() as i32,
-        );
         truth.insert(
             (f.entity_type, f.osm_id),
-            (expect.0, expect.1, tags.span(f.tags).to_vec()),
+            (f.anchor, tags.span(f.tags).to_vec()),
         );
     }
 
@@ -204,6 +213,7 @@ fn main() {
 
         let e = got.entry(ordinal).or_default();
         e.kind = kind;
+        e.cell = tms::morton_to_cell(code);
         e.lon_e7 = lon_e7;
         e.lat_e7 = lat_e7;
         for (_, f) in cluster::facets(&r) {
@@ -222,7 +232,6 @@ fn main() {
     let (mut tags_ok, mut tags_bad) = (0u64, 0u64);
     let mut kind_bad = 0u64;
     let mut missing = 0u64;
-    let mut derived_max = 0u32;
     let mut shown = 0u32;
 
     for (ordinal, rec) in &got {
@@ -236,7 +245,7 @@ fn main() {
         let kind = u16::from_str_radix(kind_hex, 16).expect("hex kind");
         let osm_id: i64 = id_str.parse().expect("numeric id");
 
-        let Some((lon_e7, lat_e7, want_tags)) = truth.get(&(kind, osm_id)) else {
+        let Some((want_anchor, want_tags)) = truth.get(&(kind, osm_id)) else {
             missing += 1;
             continue;
         };
@@ -246,36 +255,33 @@ fn main() {
             kind_bad += 1;
         }
 
-        let d = (
-            (rec.lon_e7 - *lon_e7).unsigned_abs(),
-            (rec.lat_e7 - *lat_e7).unsigned_abs(),
-        );
-        if kind == OSM_NODE {
-            // A node's coordinate IS a grid point, so the round trip is exact
-            // or the key lost it. No tolerance: that is the whole claim.
-            if d == (0, 0) {
-                node_pos_ok += 1;
-            } else {
-                node_pos_bad += 1;
+        // Both contracts are now `assert_eq!` on integers. The derived one used
+        // to be "within one grid step", because the anchor was an f64 centroid
+        // compared against OSM's 1e-7 grid — the wrong grid for a value that was
+        // never an OSM coordinate. Deriving in the key's own grid instead makes
+        // the anchor a grid point BY CONSTRUCTION, so the tolerance is gone.
+        match want_anchor {
+            Anchor::Published { lon, lat } => {
+                // A node's coordinate IS an OSM grid point, so the round trip
+                // reproduces that integer or the key lost it.
+                let want = (
+                    (lon * tms::OSM_GRID_PER_DEGREE).round() as i32,
+                    (lat * tms::OSM_GRID_PER_DEGREE).round() as i32,
+                );
+                if (rec.lon_e7, rec.lat_e7) == want {
+                    node_pos_ok += 1;
+                } else {
+                    node_pos_bad += 1;
+                }
             }
-        } else {
-            // A derived anchor is an arbitrary f64 centroid, NOT a grid point.
-            // The key snaps it to a cell, and the cell centre rounds to the
-            // grid point nearest THE CENTRE — which is a neighbour of the one
-            // nearest the centroid whenever the centroid sits off-centre. So
-            // exact equality is the wrong criterion here and asserting it
-            // measured nothing but that centroids are not grid points (it
-            // "failed" 435,426 of 1,333,178 on the first run).
-            //
-            // The right claim is quantisation: the recovered point is within
-            // one grid step of the anchor. The observed maximum is reported,
-            // so a genuine key defect would show up as a larger deviation
-            // rather than hiding under a generous bound.
-            derived_max = derived_max.max(d.0.max(d.1));
-            if d.0 <= 1 && d.1 <= 1 {
-                derived_pos_ok += 1;
-            } else {
-                derived_pos_bad += 1;
+            Anchor::Derived(cell) => {
+                // A derived anchor is a cell; the key carries cells; so the
+                // check is cell equality, with no float anywhere in it.
+                if rec.cell == *cell {
+                    derived_pos_ok += 1;
+                } else {
+                    derived_pos_bad += 1;
+                }
             }
         }
 
@@ -308,7 +314,7 @@ fn main() {
     );
     println!(
         "derived position ok   {derived_pos_ok:>12}   bad {derived_pos_bad}   \
-(anchor quantised to the key; max deviation {derived_max} grid step(s))"
+(cell equality — integer, exact by construction)"
     );
     println!("tags exact            {tags_ok:>12}   bad {tags_bad}");
 
