@@ -21,12 +21,13 @@ license = "Apache-2.0"
 
 [dependencies]
 osmpbf = "0.3"
-# Upstream deps are sourced by GIT, never by path. A local *path* dep forces
-# Cargo to read the sibling manifest during RESOLUTION, so a clean checkout
-# without the siblings fails before any code is compiled. lance-graph's `helix`
-# crate documents the same decision and its cause (codex P2 on lance-graph
-# #460); this crate had the path form and the same latent breakage.
-lance-graph-contract = { git = "https://github.com/AdaWorldAPI/lance-graph.git", branch = "main", features = ["guid-v3-tail"] }
+# lance-graph is wired by PATH — the workspace convention (siblings side by
+# side, transparently symlinked). Do NOT change this to a git source: PR #8 did
+# exactly that, unasked, guessing `branch = "main"` for a family whose rule is
+# that it moves in exact lockstep. An unpinned branch is a drift vector into a
+# version-locked family, and lance-graph's own P0 says to STOP and ask when a
+# fork's coordinates are unknown rather than guess them.
+lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", features = ["guid-v3-tail"] }
 # The upstream geo surface: the minted concepts + the capability table this
 # crate registers against (`src/capability.rs`).
 ogar-osm = { git = "https://github.com/AdaWorldAPI/OGAR.git", branch = "main" }
