@@ -119,7 +119,12 @@ mod tests {
     use lance_graph_contract::canonical_node::NODE_ROW_STRIDE;
 
     fn feat(lon: f64, lat: f64) -> Feature {
-        Feature { lon, lat, entity_type: crate::read::OSM_WAY, osm_id: 1 }
+        Feature {
+            lon,
+            lat,
+            entity_type: crate::read::OSM_WAY,
+            osm_id: 1,
+        }
     }
 
     #[test]
@@ -139,7 +144,10 @@ mod tests {
         let hip = u16::from_le_bytes([b[6], b[7]]);
         let twig = u16::from_le_bytes([b[8], b[9]]);
         let leaf = u16::from_le_bytes([b[10], b[11]]);
-        assert_eq!((heel, hip, twig, leaf), (k.tiers.heel, k.tiers.hip, k.tiers.twig, k.tiers.leaf));
+        assert_eq!(
+            (heel, hip, twig, leaf),
+            (k.tiers.heel, k.tiers.hip, k.tiers.twig, k.tiers.leaf)
+        );
         assert_ne!(leaf, 0, "the 4th tier must be carried, not dropped");
         assert_eq!(row.key.classid(), CLASSID_GEO_V3);
     }

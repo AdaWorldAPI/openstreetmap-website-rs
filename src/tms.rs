@@ -49,10 +49,7 @@ pub fn lonlat_to_tile(lon: f64, lat: f64, z: u32) -> (u32, u32) {
     let merc_y = (lat_rad.tan() + 1.0 / lat_rad.cos()).ln();
     let y = ((1.0 - merc_y / PI) / 2.0 * n).floor();
     let max = n - 1.0;
-    (
-        x.clamp(0.0, max) as u32,
-        y.clamp(0.0, max) as u32,
-    )
+    (x.clamp(0.0, max) as u32, y.clamp(0.0, max) as u32)
 }
 
 /// OSM-XYZ tile `y` → Cesium TMS `y` at zoom `z` — the Q3 boundary flip.
@@ -123,7 +120,10 @@ mod tests {
         let (x, y) = lonlat_to_tile(13.404954, 52.520008, HHTL_DEPTH4);
         let xyz = morton64(x, y);
         let tms = point_to_tms_morton(13.404954, 52.520008);
-        assert_ne!(tms, xyz, "TMS and XYZ keys must diverge off the equator row");
+        assert_ne!(
+            tms, xyz,
+            "TMS and XYZ keys must diverge off the equator row"
+        );
     }
 
     #[test]
