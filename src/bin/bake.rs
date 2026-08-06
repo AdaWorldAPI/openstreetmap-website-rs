@@ -13,7 +13,7 @@
 
 use std::io::Write;
 
-use osm_soa_bake::codebook::{write_books, Books};
+use osm_soa_bake::codebook::{write_books, Books, Header, SlabHasher};
 use osm_soa_bake::{read, row, tms};
 
 fn main() {
@@ -75,17 +75,62 @@ fn main() {
         t1.elapsed().as_secs_f64()
     );
 
-    // ── The codebooks, written FIRST. ──
+    // ── Emit. Streamed, so peak memory is the keyed vec, not the slab. ──
     //
-    // Order is deliberate: a slab without its books is unreadable, so the books
-    // must never be the thing that failed to appear. If the sidecar cannot be
-    // written the bake stops before any slab exists.
+    // The slab goes to a TEMP path and is renamed only after the sidecar
+    // exists. The sidecar has to carry the slab's digest, so it cannot be
+    // written first — but a slab without its books is unreadable, so it must
+    // not appear first either. Writing to `.tmp` and renaming last satisfies
+    // both: a complete slab only ever exists once its books do.
+    let t2 = std::time::Instant::now();
+    let tmp = format!("{output}.tmp");
+    let mut hasher = SlabHasher::new();
+    let mut slots_written = 0u64;
+    {
+        let f = std::fs::File::create(&tmp).expect("create output");
+        let mut w = std::io::BufWriter::with_capacity(1 << 22, f);
+        for k in &keyed {
+            let r = row::build_row(k, &tags);
+            slots_written += osm_soa_bake::cluster::filled_slots(&r) as u64;
+            // SAFETY: NodeRow is #[repr(C, align(64))] with a compile-asserted
+            // 512-byte size and no padding-dependent semantics; the canon defines
+            // the row AS its little-endian bytes.
+            let bytes: &[u8; 512] = unsafe { &*(std::ptr::addr_of!(r).cast()) };
+            hasher.eat(bytes);
+            w.write_all(bytes).expect("write row");
+        }
+        w.flush().expect("flush");
+    }
+    let bytes = keyed.len() as u64 * 512;
+
+    // The occupancy guard, as a REFUSAL rather than a report. A bake that
+    // filled no slot produced a slab of keys and nothing else — the defect that
+    // survived undetected because in-process verification resolved identities
+    // the bake never did. Recording zero and comparing zero to zero would agree;
+    // stopping is what makes it impossible.
+    if slots_written == 0 {
+        eprintln!(
+            "refusing to emit: {} rows, ZERO facet slots filled — the pipeline \
+             produced keys and nothing else",
+            keyed.len()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        std::process::exit(1);
+    }
+
+    // ── The codebooks, with the header that pins them to this slab. ──
     let books_path = format!("{output}.books");
     {
         let f = std::fs::File::create(&books_path).expect("create codebook sidecar");
         let mut w = std::io::BufWriter::new(f);
         write_books(
             &mut w,
+            &Header {
+                rows: keyed.len() as u64,
+                slots_written,
+                slab: hasher.finish(),
+                rounding: tms::AnchorRounding::CURRENT,
+            },
             &Books {
                 identities,
                 tag_keys: tags.keys.clone(),
@@ -95,21 +140,7 @@ fn main() {
         .expect("write codebooks");
         w.flush().expect("flush codebooks");
     }
-
-    // ── Emit. Streamed, so peak memory is the keyed vec, not the slab. ──
-    let t2 = std::time::Instant::now();
-    let f = std::fs::File::create(output).expect("create output");
-    let mut w = std::io::BufWriter::with_capacity(1 << 22, f);
-    for k in &keyed {
-        let r = row::build_row(k, &tags);
-        // SAFETY: NodeRow is #[repr(C, align(64))] with a compile-asserted
-        // 512-byte size and no padding-dependent semantics; the canon defines
-        // the row AS its little-endian bytes.
-        let bytes: &[u8; 512] = unsafe { &*(std::ptr::addr_of!(r).cast()) };
-        w.write_all(bytes).expect("write row");
-    }
-    w.flush().expect("flush");
-    let bytes = keyed.len() as u64 * 512;
+    std::fs::rename(&tmp, output).expect("publish slab");
 
     // ── Report. Every number measured from what was emitted. ──
     let uniq_heel = {
@@ -135,6 +166,8 @@ fn main() {
     println!("  distinct keys       {:>12}", stats.distinct_tag_keys);
     println!("  distinct values     {:>12}", stats.distinct_tag_values);
     println!("continuation rows     {:>12}", continuations);
+    println!("facet slots written   {:>12}", slots_written);
+    println!("slab digest           {:>12x}", hasher.finish());
     println!("ROWS                  {:>12}", keyed.len());
     println!(
         "bytes                 {:>12}  ({:.2} GiB at stride 512)",

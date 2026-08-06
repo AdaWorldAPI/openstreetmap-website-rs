@@ -6,8 +6,45 @@
 //! which is a weaker claim than it looks (it never proves the artifact on disk
 //! is readable at all).
 //!
-//! This module is the sidecar: three books — element identities, tag keys, tag
-//! values — in one deterministic file.
+//! This module is the sidecar: a header plus three books — element identities,
+//! tag keys, tag values — in one deterministic file.
+//!
+//! # The header pins the slab, and why only one direction stores bytes
+//!
+//! Two intact artifacts can still be a **wrong marriage**: a valid slab paired
+//! with valid books from a different bake reads cleanly and resolves every
+//! ordinal to a plausible neighbouring element. Nothing about either file, on
+//! its own, notices.
+//!
+//! So the header carries the slab's [`hash_slab`] digest, its row count, and
+//! the number of facet slots the bake filled. Reading the pair verifies all
+//! three; a foreign slab is refused.
+//!
+//! **The reverse direction cannot store bytes, and that is deliberate.** The
+//! slab has no header by design — it *is* the 512-byte row stride, which is
+//! exactly what makes it something Lance can read as columns. Adding a header
+//! row would break that property, and stealing key bits for a bake stamp would
+//! violate slot purity (le-contract §2). What is achievable, and sufficient, is
+//! that the *check* is symmetric even though the storage is not: given a slab,
+//! computing its digest and asking whether these books claim it is the same
+//! test run from the other side. Neither artifact can be silently paired with a
+//! foreign counterpart; only one of them holds the bytes that say so.
+//!
+//! # The occupancy guard
+//!
+//! `slots_written` is the header field that turns the empty-slab defect from a
+//! sampling find into a structural impossibility. The verifier re-counts filled
+//! slots and compares — but note that comparison alone would NOT have caught
+//! that defect, because a bake writing nothing records zero and the two agree.
+//! The refusal that actually catches it lives in `bake`: a bake that filled no
+//! slot at all is a pipeline that produced nothing, and it stops rather than
+//! emitting an artifact.
+//!
+//! # The rounding rule
+//!
+//! [`AnchorRounding`] rides in the header as a stable discriminant, so a reader
+//! in another language reads the derived-anchor contract instead of
+//! reconstructing it from Rust documentation.
 //!
 //! # Why the digest is the point, not the bytes
 //!
@@ -29,7 +66,11 @@
 //! Little-endian throughout, matching the slab it accompanies.
 //!
 //! ```text
-//! magic     8  b"OSMCBK\0\x01"
+//! magic     8  b"OSMCBK\0\x02"
+//! rows      8  u64 — rows the bake wrote
+//! slots     8  u64 — facet slots the bake filled (occupancy guard)
+//! slab      8  u64 — hash_slab of the slab this sidecar belongs to
+//! rounding  4  u32 — AnchorRounding discriminant; 0 is refused
 //! books     4  u32, always 3 (identity, tag keys, tag values)
 //! per book:
 //!   digest  8  u64 — IdentityCodebook::digest of the entries that follow
@@ -51,8 +92,70 @@ use std::io::{Read, Write};
 
 use lance_graph_contract::identity_quad::IdentityCodebook;
 
+use crate::tms::AnchorRounding;
+
+/// FNV-1a over the slab's bytes.
+///
+/// The same construction `IdentityCodebook::digest` uses, so the artifact has
+/// **one** hash convention rather than two. Explicitly **not cryptographic**:
+/// this is a pairing check — "are these two files from the same bake" — not a
+/// tamper seal. An adversary is not the threat model; a mismatched pair on a
+/// disk is.
+#[must_use]
+pub fn hash_slab(bytes: &[u8]) -> u64 {
+    let mut h = SlabHasher::new();
+    h.eat(bytes);
+    h.finish()
+}
+
+/// Streaming form of [`hash_slab`], so a bake can hash while it writes instead
+/// of re-reading 1.2 GiB afterwards.
+#[derive(Debug, Clone, Copy)]
+pub struct SlabHasher(u64);
+
+impl Default for SlabHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SlabHasher {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        SlabHasher(Self::OFFSET)
+    }
+
+    pub fn eat(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    #[must_use]
+    pub const fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// What the bake asserts about the slab this sidecar belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// Rows the bake wrote.
+    pub rows: u64,
+    /// Facet slots the bake filled — the occupancy guard.
+    pub slots_written: u64,
+    /// [`hash_slab`] of those rows.
+    pub slab: u64,
+    /// The rule [`crate::tms::mean_cell`] rounded with.
+    pub rounding: AnchorRounding,
+}
+
 /// File magic + format version.
-pub const MAGIC: [u8; 8] = *b"OSMCBK\0\x01";
+pub const MAGIC: [u8; 8] = *b"OSMCBK\0\x02";
 
 /// Books in the file, in order: identities, tag keys, tag values.
 pub const BOOKS: usize = 3;
@@ -78,6 +181,16 @@ pub enum BookError {
     },
     /// The codebook refused the key list.
     Codebook(lance_graph_contract::identity_quad::CodebookError),
+    /// The header names a rounding rule this build does not implement — or the
+    /// unspecified value `0`. Refused, never defaulted.
+    Rounding(u32),
+    /// The slab does not match what this sidecar says it belongs to: a
+    /// **wrong marriage** of two individually-valid artifacts.
+    SlabMismatch {
+        field: &'static str,
+        recorded: u64,
+        actual: u64,
+    },
 }
 
 impl std::fmt::Display for BookError {
@@ -98,6 +211,21 @@ impl std::fmt::Display for BookError {
                  the slab's ordinals do not address this book"
             ),
             BookError::Codebook(e) => write!(f, "codebook: {e:?}"),
+            BookError::Rounding(v) => {
+                write!(
+                    f,
+                    "unknown anchor-rounding rule {v} — refused, not defaulted"
+                )
+            }
+            BookError::SlabMismatch {
+                field,
+                recorded,
+                actual,
+            } => write!(
+                f,
+                "slab {field} mismatch: sidecar records {recorded}, slab has {actual} — \
+                 these two artifacts are not from the same bake"
+            ),
         }
     }
 }
@@ -141,8 +269,12 @@ fn write_book<W: Write>(w: &mut W, book: &IdentityCodebook) -> std::io::Result<(
 /// # Errors
 ///
 /// Any I/O failure from `w`.
-pub fn write_books<W: Write>(w: &mut W, books: &Books) -> std::io::Result<()> {
+pub fn write_books<W: Write>(w: &mut W, header: &Header, books: &Books) -> std::io::Result<()> {
     w.write_all(&MAGIC)?;
+    w.write_all(&header.rows.to_le_bytes())?;
+    w.write_all(&header.slots_written.to_le_bytes())?;
+    w.write_all(&header.slab.to_le_bytes())?;
+    w.write_all(&header.rounding.wire().to_le_bytes())?;
     w.write_all(&(BOOKS as u32).to_le_bytes())?;
     for book in books.each() {
         write_book(w, book)?;
@@ -199,22 +331,66 @@ fn read_book<R: Read>(r: &mut R, index: usize) -> Result<IdentityCodebook, BookE
 /// [`BookError`] — bad magic, a truncated record, a non-UTF-8 key, a book the
 /// codebook refuses, or (the one that matters) a digest that does not
 /// reproduce.
-pub fn read_books<R: Read>(r: &mut R) -> Result<Books, BookError> {
+pub fn read_books<R: Read>(r: &mut R) -> Result<(Header, Books), BookError> {
     let magic = read_exact_n(r, MAGIC.len())?;
     if magic[..] != MAGIC[..] {
         let mut m = [0u8; 8];
         m.copy_from_slice(&magic);
         return Err(BookError::Magic(m));
     }
+    let rows = read_u64(r)?;
+    let slots_written = read_u64(r)?;
+    let slab = read_u64(r)?;
+    let rw = read_u32(r)?;
+    let rounding = AnchorRounding::from_wire(rw).ok_or(BookError::Rounding(rw))?;
     let n = read_u32(r)?;
     if n as usize != BOOKS {
         return Err(BookError::BookCount(n));
     }
-    Ok(Books {
+    let books = Books {
         identities: read_book(r, 0)?,
         tag_keys: read_book(r, 1)?,
         tag_values: read_book(r, 2)?,
-    })
+    };
+    Ok((
+        Header {
+            rows,
+            slots_written,
+            slab,
+            rounding,
+        },
+        books,
+    ))
+}
+
+/// Check a slab against the sidecar that claims it.
+///
+/// This is the marriage test: three fields, any one of which failing means the
+/// two artifacts are not from the same bake. `slots_written` is compared by the
+/// CALLER (it must walk the rows to count), so this checks what can be checked
+/// from the bytes alone.
+///
+/// # Errors
+///
+/// [`BookError::SlabMismatch`] naming the field that disagreed.
+pub fn verify_slab(header: &Header, slab_bytes: &[u8], stride: usize) -> Result<(), BookError> {
+    let rows = (slab_bytes.len() / stride) as u64;
+    if rows != header.rows {
+        return Err(BookError::SlabMismatch {
+            field: "row count",
+            recorded: header.rows,
+            actual: rows,
+        });
+    }
+    let h = hash_slab(slab_bytes);
+    if h != header.slab {
+        return Err(BookError::SlabMismatch {
+            field: "digest",
+            recorded: header.slab,
+            actual: h,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -223,6 +399,15 @@ mod tests {
 
     fn book(keys: &[&str]) -> IdentityCodebook {
         IdentityCodebook::try_new(keys.iter().map(|s| (*s).to_string())).expect("small book")
+    }
+
+    fn head() -> Header {
+        Header {
+            rows: 7,
+            slots_written: 42,
+            slab: 0xdead_beef_0bad_f00d,
+            rounding: AnchorRounding::HalfUp,
+        }
     }
 
     fn sample() -> Books {
@@ -237,8 +422,9 @@ mod tests {
     fn books_round_trip_through_the_file() {
         let want = sample();
         let mut buf = Vec::new();
-        write_books(&mut buf, &want).expect("write");
-        let got = read_books(&mut buf.as_slice()).expect("read");
+        write_books(&mut buf, &head(), &want).expect("write");
+        let (gh, got) = read_books(&mut buf.as_slice()).expect("read");
+        assert_eq!(gh, head(), "the header must survive verbatim");
 
         for (a, b) in want.each().into_iter().zip(got.each()) {
             assert_eq!(a.len(), b.len());
@@ -264,13 +450,18 @@ mod tests {
         // to a NEIGHBOURING element — valid-looking on both sides, and
         // invisible to verify_bijective. The digest is what catches it.
         let mut buf = Vec::new();
-        write_books(&mut buf, &sample()).expect("write");
+        write_books(&mut buf, &head(), &sample()).expect("write");
 
         // Rewrite the identity book with one extra early-sorting key, leaving
         // the recorded digest untouched — exactly the drift being guarded.
         let drifted = book(&["0f01:1", "0f01:42", "0f02:42", "0f02:7"]);
         let mut tampered = Vec::new();
         tampered.extend_from_slice(&MAGIC);
+        let h = head();
+        tampered.extend_from_slice(&h.rows.to_le_bytes());
+        tampered.extend_from_slice(&h.slots_written.to_le_bytes());
+        tampered.extend_from_slice(&h.slab.to_le_bytes());
+        tampered.extend_from_slice(&h.rounding.wire().to_le_bytes());
         tampered.extend_from_slice(&(BOOKS as u32).to_le_bytes());
         tampered.extend_from_slice(&sample().identities.digest().to_le_bytes()); // stale
         tampered.extend_from_slice(&(drifted.len() as u32).to_le_bytes());
@@ -294,6 +485,73 @@ mod tests {
     }
 
     #[test]
+    fn a_slab_from_a_different_bake_is_refused() {
+        // The WRONG MARRIAGE: both artifacts individually valid, from different
+        // bakes. Nothing about either file notices on its own — every ordinal
+        // still resolves, to a plausible neighbour.
+        let stride = 512usize;
+        let slab = vec![7u8; stride * 3];
+        let h = Header {
+            rows: 3,
+            slots_written: 9,
+            slab: hash_slab(&slab),
+            rounding: AnchorRounding::HalfUp,
+        };
+        assert!(
+            verify_slab(&h, &slab, stride).is_ok(),
+            "its own slab passes"
+        );
+
+        // One byte different: same length, same row count, different bake.
+        let mut other = slab.clone();
+        other[stride] ^= 1;
+        assert!(matches!(
+            verify_slab(&h, &other, stride),
+            Err(BookError::SlabMismatch {
+                field: "digest",
+                ..
+            })
+        ));
+
+        // A different row count is caught before the digest is even computed.
+        let short = vec![7u8; stride * 2];
+        assert!(matches!(
+            verify_slab(&h, &short, stride),
+            Err(BookError::SlabMismatch {
+                field: "row count",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_rounding_rule_is_refused_not_defaulted() {
+        // A reader that silently assumed half-up would reproduce derived
+        // anchors WRONG for a bake made under any other rule, and every one of
+        // them would still look like a valid cell.
+        assert_eq!(
+            AnchorRounding::from_wire(0),
+            None,
+            "unspecified is not a rule"
+        );
+        assert_eq!(AnchorRounding::from_wire(99), None);
+        assert_eq!(
+            AnchorRounding::from_wire(AnchorRounding::HalfUp.wire()),
+            Some(AnchorRounding::HalfUp),
+            "…and the rule in force round-trips, so the refusal discriminates"
+        );
+
+        let mut buf = Vec::new();
+        write_books(&mut buf, &head(), &sample()).expect("write");
+        // Zero the rounding field in place: byte offset 8 + 8 + 8 + 8.
+        buf[32..36].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            read_books(&mut buf.as_slice()),
+            Err(BookError::Rounding(0))
+        ));
+    }
+
+    #[test]
     fn a_foreign_or_truncated_file_is_refused() {
         assert!(matches!(
             read_books(&mut b"not-a-book".as_slice()),
@@ -301,10 +559,10 @@ mod tests {
         ));
 
         let mut buf = Vec::new();
-        write_books(&mut buf, &sample()).expect("write");
+        write_books(&mut buf, &head(), &sample()).expect("write");
         // Every truncation point must refuse — a short read that silently
         // yielded a partial book would hand back ordinals addressing nothing.
-        for cut in [8usize, 12, 20, 24, 30] {
+        for cut in [8usize, 20, 36, 40, 48, 56] {
             assert!(
                 read_books(&mut &buf[..cut.min(buf.len())]).is_err(),
                 "truncation at {cut} must be refused"

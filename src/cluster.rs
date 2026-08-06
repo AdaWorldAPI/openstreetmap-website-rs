@@ -164,10 +164,18 @@ pub fn read_facet(row: &NodeRow, slot: usize) -> Option<Facet> {
     }
 }
 
-/// Every occupied facet of a cluster row, in slot order.
+/// How many facet slots this row has filled — the occupancy guard's unit.
 ///
-/// Stops at nothing — an empty slot is simply skipped, so a row with gaps
-/// reads the same as a compact one.
+/// Counts without materialising the facets, because a bake calls it once per
+/// row over millions of rows and a `Vec` per row is pure waste there.
+#[must_use]
+pub fn filled_slots(row: &NodeRow) -> usize {
+    (RESERVED_SLOTS..ROW_SLOTS)
+        .filter(|&s| read_facet(row, s).is_some())
+        .count()
+}
+
+/// Every occupied facet of a cluster row, in slot order.
 #[must_use]
 pub fn facets(row: &NodeRow) -> Vec<(usize, Facet)> {
     (RESERVED_SLOTS..ROW_SLOTS)
