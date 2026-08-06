@@ -243,7 +243,7 @@ mod tests {
             osm_id: 1,
             tags: crate::tags::TagSpan::default(),
         });
-        let row = build_row(&k);
+        let row = build_row(&k, &crate::tags::TagStore::default().resolve().unwrap());
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 core::ptr::from_ref(&row).cast::<u8>(),

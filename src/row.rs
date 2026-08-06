@@ -11,7 +11,21 @@ use lance_graph_contract::canonical_node::{EdgeBlock, NodeGuid, NodeRow, TailVar
 use lance_graph_contract::identity_quad::{CodebookError, IdentityCodebook};
 
 use crate::read::Feature;
+use crate::tags::{ResolvedTags, TagSpan};
 use crate::tms::{self, Tiers};
+
+/// Tag facets one row can carry: everything after the key, edges, identity and
+/// the reserved slope slot.
+///
+/// The slope slot is skipped rather than reused. It is dormant in this bake but
+/// **reserved** — the CANON's RESERVE-DON'T-RECLAIM rule reads a zero tier as
+/// *not consulted*, never as *free space*, and a bake that packed tags into it
+/// would silently collide the day a slope lands.
+pub const TAGS_PER_ROW: usize = ogar_osm::ROW_SLOTS - ogar_osm::GEO_SLOPE_SLOT - 1;
+const _: () = assert!(TAGS_PER_ROW == 28);
+
+/// The first slot a tag facet may occupy.
+const FIRST_TAG_SLOT: usize = ogar_osm::GEO_SLOPE_SLOT + 1;
 
 /// Geo-V3 classid: geo domain `0x0F` + appid `0x01` (q2) in the canon HIGH
 /// half, V3 marker `0x1000` in the custom LOW half — the post-2026-07-02
@@ -64,6 +78,15 @@ pub struct Keyed {
     /// without it carries no identity rather than a wrong one.
     pub identity_ordinal: Option<u32>,
     pub identity: u16,
+    /// The tags this ROW carries — not necessarily the whole feature's.
+    ///
+    /// A feature with more than [`TAGS_PER_ROW`] tags is split by
+    /// [`expand_tag_overflow`] into several `Keyed`s over disjoint sub-spans,
+    /// each of which becomes its own row. Every such row still carries the
+    /// identity facet, so a continuation is self-describing: a reader
+    /// reassembles a feature by grouping rows on `(kind, ordinal)`, never by
+    /// row adjacency.
+    pub tags: TagSpan,
 }
 
 /// Key a feature: TMS Morton at z=32 → four cascade tiers.
@@ -77,7 +100,61 @@ pub fn key_feature(f: &Feature) -> Keyed {
         osm_id: f.osm_id,
         identity_ordinal: None,
         identity: 0,
+        tags: f.tags,
     }
+}
+
+/// Split any feature carrying more than [`TAGS_PER_ROW`] tags into a run of
+/// `Keyed`s over disjoint tag sub-spans, so every row's tags fit its slots.
+///
+/// Returns the number of **continuation** rows added — measured, not assumed:
+/// the `tier_probe` distribution says this is a fraction of a percent on Berlin,
+/// and a bake that silently truncated instead would drop tags from exactly the
+/// richest features (the ones a renderer most needs).
+///
+/// Continuations are not marked as such, deliberately. Each carries the same
+/// identity facet, so a reader reassembles a feature by grouping on
+/// `(kind, ordinal)` — order-independent, and correct even if rows are shuffled
+/// or a fragment is read alone.
+pub fn expand_tag_overflow(keyed: &mut Vec<Keyed>) -> u64 {
+    let per = TAGS_PER_ROW as u32;
+    let mut extra: Vec<Keyed> = Vec::new();
+    for k in keyed.iter_mut() {
+        if k.tags.len <= per {
+            continue;
+        }
+        let full = k.tags;
+        k.tags = TagSpan {
+            start: full.start,
+            len: per,
+        };
+        let mut off = per;
+        while off < full.len {
+            let len = (full.len - off).min(per);
+            extra.push(Keyed {
+                tags: TagSpan {
+                    start: full.start + off,
+                    len,
+                },
+                ..*k
+            });
+            off += len;
+        }
+    }
+    let added = extra.len() as u64;
+    keyed.append(&mut extra);
+    added
+}
+
+/// A row with no tags — for tests whose subject is key layout, not tags.
+#[cfg(test)]
+pub(crate) fn build_row_notags(k: &Keyed) -> NodeRow {
+    build_row(
+        k,
+        &crate::tags::TagStore::default()
+            .resolve()
+            .expect("an empty store resolves"),
+    )
 }
 
 /// Build the 512-byte row for one keyed feature.
@@ -105,7 +182,7 @@ pub fn key_feature(f: &Feature) -> Keyed {
 /// tenant lane would store one fact twice under two incompatible readings.
 /// That is a drift generator, not redundancy. See `crate::identity`.
 #[must_use]
-pub fn build_row(k: &Keyed) -> NodeRow {
+pub fn build_row(k: &Keyed, tags: &ResolvedTags) -> NodeRow {
     let key = NodeGuid::mint_for(
         TAIL,
         CLASSID_GEO_V3,
@@ -129,6 +206,14 @@ pub fn build_row(k: &Keyed) -> NodeRow {
              must not key a row it cannot identify",
             k.entity_type
         );
+        // Tags bind to the feature by ORDINAL, not by adjacency — the property
+        // that lets a continuation row be read alone (see `crate::cluster`).
+        for (i, &(key, value)) in tags.span(k.tags).iter().enumerate() {
+            debug_assert!(i < TAGS_PER_ROW, "expand_tag_overflow must have split this");
+            let wrote =
+                crate::cluster::write_tag(&mut row, FIRST_TAG_SLOT + i, ordinal, key, value);
+            debug_assert!(wrote, "tag ({key}, {value}) was refused for slot {i}");
+        }
     }
     row
 }
@@ -193,6 +278,13 @@ mod tests {
     use super::*;
     use lance_graph_contract::canonical_node::{ValueTenant, NODE_ROW_STRIDE};
 
+    /// Empty codebooks, for the tests whose subject is layout rather than tags.
+    fn no_tags() -> ResolvedTags {
+        crate::tags::TagStore::default()
+            .resolve()
+            .expect("an empty store resolves")
+    }
+
     fn feat(lon: f64, lat: f64) -> Feature {
         Feature {
             lon,
@@ -236,7 +328,7 @@ mod tests {
         // The V3 mint must not drop `leaf` — the failure the forced TailVariant
         // exists to prevent. Berlin Mitte has a non-zero leaf tier at z=32.
         let k = key_feature(&feat(13.404954, 52.520008));
-        let row = build_row(&k);
+        let row = build_row(&k, &no_tags());
         let b = row.key.as_bytes();
         let heel = u16::from_le_bytes([b[4], b[5]]);
         let hip = u16::from_le_bytes([b[6], b[7]]);
@@ -291,7 +383,7 @@ mod tests {
         // point at the wrong element and still read as valid.
         let k = key_feature(&feat(13.404954, 52.520008));
         assert_eq!(k.identity_ordinal, None);
-        let row = build_row(&k);
+        let row = build_row(&k, &no_tags());
         assert_eq!(crate::identity::read_identity(&row), None);
         assert_eq!(row.value, [0u8; 480], "no slot may be written");
     }
@@ -313,7 +405,7 @@ mod tests {
         k.osm_id = 12_000_000_001;
         let mut batch = [k];
         let book = resolve_identities(&mut batch).expect("one key fits the book");
-        let row = build_row(&batch[0]);
+        let row = build_row(&batch[0], &no_tags());
 
         // The kind + ordinal are recoverable from the slot alone, and the
         // ordinal pulls back to the original id through the codebook — the
@@ -346,6 +438,133 @@ mod tests {
         assert_eq!(others, 0, "no slot but the identity facet may be written");
     }
 
+    /// A store holding `n` distinct tags on one feature, plus its span.
+    fn tags_of(n: u32) -> (ResolvedTags, TagSpan) {
+        let mut store = crate::tags::TagStore::default();
+        let pairs: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("k{i:04}"), format!("v{i:04}")))
+            .collect();
+        let span = store.push(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        (store.resolve().expect("small books"), span)
+    }
+
+    #[test]
+    fn a_features_tags_land_in_its_own_row_and_read_back() {
+        let (tags, span) = tags_of(3);
+        let mut k = key_feature(&feat(13.404954, 52.520008));
+        k.tags = span;
+        let mut batch = [k];
+        resolve_identities(&mut batch).unwrap();
+        let row = build_row(&batch[0], &tags);
+
+        let ordinal = batch[0].identity_ordinal.unwrap();
+        let got: Vec<(u32, u32)> = crate::cluster::facets(&row)
+            .into_iter()
+            .filter_map(|(_, f)| match f {
+                crate::cluster::Facet::Tag {
+                    member, key, value, ..
+                } if member == ordinal => Some((key, value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            tags.span(span),
+            "every tag, in order, bound to the feature"
+        );
+
+        // Can-stay-silent half: a feature with no tags writes none, so the
+        // read above is measuring stored tags rather than always finding some.
+        let bare_keyed = Keyed {
+            tags: TagSpan::default(),
+            ..batch[0]
+        };
+        let bare = build_row(&bare_keyed, &tags);
+        assert_eq!(crate::cluster::facets(&bare).len(), 1, "identity only");
+    }
+
+    #[test]
+    fn the_reserved_slope_slot_is_never_written_by_a_tag() {
+        // RESERVE-DON'T-RECLAIM, as a behaviour rather than a comment: packing
+        // tags from slot 3 would collide the day a slope facet lands, and the
+        // collision would read as a valid slope.
+        let (tags, span) = tags_of(TAGS_PER_ROW as u32);
+        let mut k = key_feature(&feat(13.404954, 52.520008));
+        k.tags = span;
+        let mut batch = [k];
+        resolve_identities(&mut batch).unwrap();
+        let row = build_row(&batch[0], &tags);
+
+        let off = crate::identity::slab_offset_of_slot(ogar_osm::GEO_SLOPE_SLOT).unwrap();
+        assert_eq!(
+            row.value[off..off + crate::identity::SLOT_BYTES],
+            [0u8; 16],
+            "the slope slot must stay dormant even on a full row"
+        );
+        // …and the row really is full, so the assertion is not passing because
+        // there were few tags.
+        assert_eq!(crate::cluster::facets(&row).len(), 1 + TAGS_PER_ROW);
+    }
+
+    #[test]
+    fn overflow_splits_into_continuations_that_reassemble_by_ordinal() {
+        // Two-sided on the boundary: exactly TAGS_PER_ROW must NOT split, one
+        // more must. A test that only checked the splitting half would pass on
+        // an implementation that split everything.
+        let (_, exact) = tags_of(TAGS_PER_ROW as u32);
+        let mut at_bound = vec![Keyed {
+            tags: exact,
+            ..key_feature(&feat(13.4, 52.5))
+        }];
+        assert_eq!(
+            expand_tag_overflow(&mut at_bound),
+            0,
+            "a full row must not split"
+        );
+        assert_eq!(at_bound.len(), 1);
+
+        let n = TAGS_PER_ROW as u32 * 2 + 5;
+        let (tags, span) = tags_of(n);
+        let mut over = vec![Keyed {
+            tags: span,
+            ..key_feature(&feat(13.4, 52.5))
+        }];
+        assert_eq!(
+            expand_tag_overflow(&mut over),
+            2,
+            "three rows, two of them new"
+        );
+        resolve_identities(&mut over).unwrap();
+
+        // Every row carries the SAME identity, and the union of their tags is
+        // the original list with nothing lost or duplicated.
+        let ordinals: Vec<Option<u32>> = over.iter().map(|k| k.identity_ordinal).collect();
+        assert!(
+            ordinals.windows(2).all(|w| w[0] == w[1]),
+            "one feature, one ordinal"
+        );
+
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        for k in &over {
+            assert!(k.tags.len as usize <= TAGS_PER_ROW);
+            let row = build_row(k, &tags);
+            seen.extend(
+                crate::cluster::facets(&row)
+                    .into_iter()
+                    .filter_map(|(_, f)| match f {
+                        crate::cluster::Facet::Tag { key, value, .. } => Some((key, value)),
+                        crate::cluster::Facet::Member { .. } => None,
+                    }),
+            );
+        }
+        assert_eq!(
+            seen,
+            tags.span(span),
+            "reassembly must be lossless and in order"
+        );
+        assert_eq!(seen.len(), n as usize);
+    }
+
     #[test]
     fn morton_sort_is_trie_order_and_byte_sort_is_not() {
         // The trap this module's sort key exists to avoid: the tiers are LE
@@ -353,7 +572,7 @@ mod tests {
         let a = key_feature(&feat(13.404954, 52.520008));
         let b = key_feature(&feat(13.5, 52.6));
         let (lo, hi) = if a.morton < b.morton { (a, b) } else { (b, a) };
-        let (rl, rh) = (build_row(&lo), build_row(&hi));
+        let (rl, rh) = (build_row(&lo, &no_tags()), build_row(&hi, &no_tags()));
         assert!(lo.morton < hi.morton);
         // Byte-lexicographic order over the key does not agree in general;
         // assert we did NOT rely on it by checking the tier tuple instead.

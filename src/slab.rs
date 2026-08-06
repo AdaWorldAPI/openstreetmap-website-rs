@@ -182,7 +182,7 @@ pub fn morton_bounds(z: u32, x: u32, y: u32) -> (u128, u128) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::{build_row, Keyed};
+    use crate::row::{build_row_notags, Keyed};
     use crate::tms::tiers_of;
 
     /// Build a slab from Morton codes, laid out exactly as the baker writes.
@@ -196,8 +196,9 @@ mod tests {
                 osm_id: 0,
                 identity_ordinal: None,
                 identity: 0,
+                tags: crate::tags::TagSpan::default(),
             };
-            let r = build_row(&k);
+            let r = build_row_notags(&k);
             // SAFETY: same 512-byte ABI the baker writes.
             let b: &[u8; 512] = unsafe { &*(std::ptr::addr_of!(r).cast()) };
             v.extend_from_slice(b);

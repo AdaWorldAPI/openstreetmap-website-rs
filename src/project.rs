@@ -92,17 +92,18 @@ pub fn projected_mask(surface: &WideFieldMask, role: &WideFieldMask) -> WideFiel
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::{build_row, Keyed};
+    use crate::row::{build_row_notags, Keyed};
     use crate::tms::tiers_of;
 
     fn row_with(code: u64) -> NodeRow {
-        build_row(&Keyed {
+        build_row_notags(&Keyed {
             morton: code,
             tiers: tiers_of(code),
             entity_type: crate::read::OSM_WAY,
             osm_id: 0,
             identity_ordinal: None,
             identity: 0,
+            tags: crate::tags::TagSpan::default(),
         })
     }
 

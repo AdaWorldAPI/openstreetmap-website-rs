@@ -58,6 +58,7 @@ fn main() {
     let t1 = std::time::Instant::now();
     let mut keyed: Vec<row::Keyed> = features.iter().map(row::key_feature).collect();
     drop(features);
+    let continuations = row::expand_tag_overflow(&mut keyed);
     keyed.sort_unstable_by_key(|k| k.morton);
     let collisions = row::assign_identities(&mut keyed);
     eprintln!(
@@ -71,7 +72,7 @@ fn main() {
     let f = std::fs::File::create(output).expect("create output");
     let mut w = std::io::BufWriter::with_capacity(1 << 22, f);
     for k in &keyed {
-        let r = row::build_row(k);
+        let r = row::build_row(k, &tags);
         // SAFETY: NodeRow is #[repr(C, align(64))] with a compile-asserted
         // 512-byte size and no padding-dependent semantics; the canon defines
         // the row AS its little-endian bytes.
@@ -103,6 +104,7 @@ fn main() {
     println!("tag pairs             {:>12}", stats.tag_pairs);
     println!("  distinct keys       {:>12}", stats.distinct_tag_keys);
     println!("  distinct values     {:>12}", stats.distinct_tag_values);
+    println!("continuation rows     {:>12}", continuations);
     println!("ROWS                  {:>12}", keyed.len());
     println!(
         "bytes                 {:>12}  ({:.2} GiB at stride 512)",
