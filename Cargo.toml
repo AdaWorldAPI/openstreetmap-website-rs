@@ -51,3 +51,7 @@ path = "src/bin/parity.rs"
 [[bin]]
 name = "slab_stats"
 path = "src/bin/slab_stats.rs"
+
+[[bin]]
+name = "building_probe"
+path = "src/bin/building_probe.rs"
