@@ -222,7 +222,7 @@ dependencies = [
 [[package]]
 name = "ogar-osm"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/OGAR.git?branch=main#08ed15eeb7b63827cc2ca0a5b5520ac9795b37d5"
+source = "git+https://github.com/AdaWorldAPI/OGAR.git?branch=main#aa1ddc8ded083a70fc148aa5f75c64a18c48f6f8"
 dependencies = [
  "ogar-vocab",
 ]
@@ -230,7 +230,7 @@ dependencies = [
 [[package]]
 name = "ogar-vocab"
 version = "0.1.0"
-source = "git+https://github.com/AdaWorldAPI/OGAR.git?branch=main#08ed15eeb7b63827cc2ca0a5b5520ac9795b37d5"
+source = "git+https://github.com/AdaWorldAPI/OGAR.git?branch=main#aa1ddc8ded083a70fc148aa5f75c64a18c48f6f8"
 
 [[package]]
 name = "once_cell"

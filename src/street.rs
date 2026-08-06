@@ -142,17 +142,18 @@ pub fn set_edge_names(row: &mut NodeRow, names: &[u16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::{build_row, Keyed};
+    use crate::row::{build_row_notags, Keyed};
     use crate::tms::tiers_of;
 
     fn junction(names: &[u16]) -> NodeRow {
-        let mut r = build_row(&Keyed {
+        let mut r = build_row_notags(&Keyed {
             morton: 42,
             tiers: tiers_of(42),
             entity_type: crate::read::OSM_WAY,
             osm_id: 0,
             identity_ordinal: None,
             identity: 0,
+            tags: crate::tags::TagSpan::default(),
         });
         set_edge_names(&mut r, names);
         r
