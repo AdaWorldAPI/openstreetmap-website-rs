@@ -1,10 +1,16 @@
 //! The consumer half of the OGAR plug-and-play roundtrip.
 //!
-//! `ogar_osm` declares WHAT the geo surface exposes and WHO is expected to
-//! execute it; this module is `osm-soa-bake` **trägt sich ein** — it exports
-//! the [`CapabilityRegistration`] and asserts the roundtrip in its own tests.
-//! Drift bangs once, here: a capability added upstream with no arm, an arm for
-//! a capability upstream dropped, or a wrong activated-concept set.
+//! `ogar_vocab::geo_actions` declares WHAT the geo surface exposes and WHO is
+//! expected to execute it; this module is `osm-soa-bake` **plugging in** —
+//! [`activate`] hands its classids to the port
+//! (`resolve_hotplug`) and gets back the activated vocab rows and capability
+//! names. Drift bangs once, here: a capability added upstream with no arm, an
+//! arm for a capability upstream dropped, or a wrong classid set.
+//!
+//! An earlier version of this module built a `CapabilityRegistration` and
+//! called a verifier that `ogar-osm` also owned — a consumer checking itself
+//! against a table that was never in `domain_tables()`. Both halves passed
+//! while the real port answered `NoCapabilitiesFor(0x0F01)`.
 //!
 //! # Why the covered list is derived, not written
 //!
@@ -25,8 +31,8 @@
 
 use lance_graph_contract::canonical_node::NodeRow;
 use lance_graph_contract::class_view::WideFieldMask;
-use ogar_osm::OSM_SUBJECT_CLASSIDS;
-use ogar_vocab::capability_registry::CapabilityRegistration;
+use ogar_osm::{plug_in, GEO_SUBJECT_CLASSIDS};
+use ogar_vocab::capability_registry::{HotplugActivation, HotplugDrift};
 
 use crate::fragment::BoundaryIndex;
 use crate::project::Projected;
@@ -90,14 +96,20 @@ pub fn covered() -> Vec<&'static str> {
     Capability::ALL.iter().map(|c| c.name()).collect()
 }
 
-/// This crate's registration against the upstream geo capability table.
-#[must_use]
-pub fn registration(covered: &'static [&'static str]) -> CapabilityRegistration {
-    CapabilityRegistration {
-        consumer: CONSUMER,
-        covered,
-        subject_classids: OSM_SUBJECT_CLASSIDS,
-    }
+/// Plug this crate's geo classids into the OGAR port and activate.
+///
+/// The consumer supplies three things and nothing else: who it is, which
+/// classids it is plugging in, and which capability arms it covers. OGAR
+/// verifies every id is minted, that each contributes at least one capability,
+/// that this consumer is expected by every contributing table, and that
+/// coverage holds in both directions — then returns the activated vocab rows
+/// and capability names.
+///
+/// # Errors
+///
+/// The [`HotplugDrift`] the port reported.
+pub fn activate() -> Result<HotplugActivation, HotplugDrift> {
+    plug_in(CONSUMER, GEO_SUBJECT_CLASSIDS, &covered())
 }
 
 // ── The dispatch arms ───────────────────────────────────────────────
@@ -153,23 +165,33 @@ pub fn polyline_length(points: &[(f64, f64)]) -> f64 {
 mod tests {
     use super::*;
     use crate::row::{build_row, key_feature};
-    use ogar_osm::OSM_CAPABILITY_NAMES;
+    use ogar_osm::GEO_ACTION_NAMES;
 
-    /// `covered()` allocates, but `CapabilityRegistration::covered` is
-    /// `&'static [&'static str]`. Leaking once in a test is the cheapest way
-    /// to bridge that without a lazy-static dependency.
-    fn static_covered() -> &'static [&'static str] {
-        Box::leak(covered().into_boxed_slice())
+    #[test]
+    fn plugging_in_activates_against_the_real_port() {
+        let (concepts, capabilities) = activate().expect("the geo domain must activate");
+        assert_eq!(capabilities.len(), GEO_ACTION_NAMES.len());
+        assert_eq!(concepts.len(), GEO_SUBJECT_CLASSIDS.len());
+        // The activation names the concepts back, so the consumer learns what
+        // it plugged into rather than only that it was accepted.
+        let names: Vec<&str> = concepts.iter().map(|&(n, _)| n).collect();
+        assert!(names.contains(&"osm_node") && names.contains(&"osm_way"));
     }
 
     #[test]
-    fn the_registration_roundtrips_against_the_upstream_table() {
-        let reg = registration(static_covered());
-        assert_eq!(
-            ogar_osm::verify_osm_registration(&reg),
-            Ok(()),
-            "this crate's arms must match the upstream geo capability table"
-        );
+    fn the_port_refuses_an_arm_this_crate_does_not_actually_cover() {
+        // Can-fire half: activation above is not "the port accepts anything".
+        // Dropping one arm from the covered set must be rejected, which is
+        // what makes the passing case meaningful.
+        let short: Vec<&str> = covered().into_iter().take(1).collect();
+        assert!(matches!(
+            plug_in(CONSUMER, GEO_SUBJECT_CLASSIDS, &short),
+            Err(HotplugDrift::Uncovered(_))
+        ));
+        assert!(matches!(
+            plug_in("some-other-crate", GEO_SUBJECT_CLASSIDS, &covered()),
+            Err(HotplugDrift::UnexpectedConsumer(_))
+        ));
     }
 
     #[test]
@@ -179,11 +201,11 @@ mod tests {
         assert_eq!(mine.len(), Capability::ALL.len());
         for name in &mine {
             assert!(
-                OSM_CAPABILITY_NAMES.contains(name),
+                GEO_ACTION_NAMES.contains(name),
                 "{name} has an arm here but is not declared upstream"
             );
         }
-        for name in OSM_CAPABILITY_NAMES {
+        for name in GEO_ACTION_NAMES {
             assert!(
                 mine.contains(name),
                 "{name} is declared upstream but has no arm here"

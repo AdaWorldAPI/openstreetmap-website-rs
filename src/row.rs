@@ -25,7 +25,19 @@ use crate::tms::{self, Tiers};
 /// make — surfaced, not filed. The geo *domain* is already minted in OGAR
 /// (`0x0F => ConceptDomain::Geo`, `osm_node 0x0F01 … osm_user 0x0F0A`); only
 /// the read-mode registration is missing.
-pub const CLASSID_GEO_V3: u32 = 0x0F01_1000;
+///
+/// **Composed, not written.** It was the literal `0x0F01_1000` until the
+/// plug-and-play rule was applied end to end: `ogar_osm::classid` delegates to
+/// `ogar_vocab::app::render_classid`, so neither half nor the shift is
+/// restated here. The concept half is `osm_node` because this is the KEY's
+/// class — the shared "geo V3 row" anchor every element kind is minted under;
+/// the per-element kind lives in the identity facet's own classid
+/// (`crate::identity`), which is what lets one key class serve all ten
+/// concepts.
+pub const CLASSID_GEO_V3: u32 = ogar_osm::classid(
+    ogar_vocab::class_ids::OSM_NODE,
+    ogar_osm::CLASSVIEW_V3_SUBSTRATE,
+);
 
 /// The tail variant is forced rather than resolved, for the reason above: an
 /// unregistered classid resolves to V1, whose `new()` has no `leaf` tier and
@@ -188,6 +200,28 @@ mod tests {
             entity_type: crate::read::OSM_WAY,
             osm_id: 1,
         }
+    }
+
+    #[test]
+    fn the_key_classid_is_composed_from_the_codebook_not_a_literal() {
+        // Pins the composed value against the halves it is built from, so a
+        // future concept renumber upstream cannot leave a stale literal here.
+        assert_eq!(
+            (CLASSID_GEO_V3 >> 16) as u16,
+            ogar_vocab::class_ids::OSM_NODE,
+            "the canon half must be the minted osm_node concept"
+        );
+        assert_eq!(
+            CLASSID_GEO_V3 as u16,
+            ogar_osm::CLASSVIEW_V3_SUBSTRATE,
+            "the custom half must be the V3 substrate ClassView"
+        );
+        // Anti-vacuity: the two halves are genuinely different values, so the
+        // assertions above are not both reading the same number.
+        assert_ne!(
+            u32::from(ogar_vocab::class_ids::OSM_NODE),
+            u32::from(ogar_osm::CLASSVIEW_V3_SUBSTRATE)
+        );
     }
 
     #[test]
