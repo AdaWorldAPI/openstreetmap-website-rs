@@ -150,6 +150,8 @@ mod tests {
             morton: 42,
             tiers: tiers_of(42),
             entity_type: crate::read::OSM_WAY,
+            osm_id: 0,
+            identity_ordinal: None,
             identity: 0,
         });
         set_edge_names(&mut r, names);

@@ -9,6 +9,7 @@
 pub mod capability;
 pub mod fragment;
 pub mod geodesy;
+pub mod identity;
 pub mod project;
 pub mod read;
 pub mod row;
