@@ -6,6 +6,7 @@
 //!
 //! [`NodeRow`]: lance_graph_contract::canonical_node::NodeRow
 
+pub mod fragment;
 pub mod geodesy;
 pub mod read;
 pub mod row;
