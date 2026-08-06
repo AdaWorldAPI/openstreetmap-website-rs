@@ -1,7 +1,7 @@
 //! `parity` — does the bake reproduce OSM's own data, element for element?
 //!
 //! ```text
-//! parity <input.osm.pbf>
+//! parity <input.osm.pbf> [<slab> <slab.books>]
 //! ```
 //!
 //! Everything else in this crate measures a *mechanism*. This measures the
@@ -9,12 +9,27 @@
 //! the bake's codebooks, yields the same element the `.osm.pbf` holds — same
 //! id, same kind, same position, same tags.
 //!
-//! It bakes and verifies in one process rather than reading a `.soa` file,
-//! because the codebooks are what make an ordinal mean anything and they are
-//! not (yet) written alongside the slab. That is a real gap, not a shortcut:
-//! **a bake that ships rows without its codebooks ships numbers.** Until the
-//! codebooks are persisted with their digests, this binary is where the two
-//! halves meet.
+//! # Two modes, and why the second one exists
+//!
+//! ```text
+//! parity <input.osm.pbf>                       # re-bake in-process, verify
+//! parity <input.osm.pbf> <slab> <slab.books>   # verify the ARTIFACT on disk
+//! ```
+//!
+//! The first mode verifies the *pipeline*. It was all this binary could do
+//! before the codebooks were persisted, and it is **strictly weaker than it
+//! looks** — it never touches the file a consumer would actually read.
+//!
+//! That weakness was not theoretical. `bake` never called
+//! `row::resolve_identities`, so every `Keyed` carried `identity_ordinal:
+//! None`, `build_row` wrote no identity facet and no tags, and the 1.2 GiB slab
+//! on disk was **keys with a wholly zeroed value slab** — 200 of 200 sampled
+//! rows. In-process parity passed the whole time, because this binary resolved
+//! the identities itself. The pipeline was correct; the artifact was empty; and
+//! only a check that opened the file could tell the difference.
+//!
+//! So the second mode is the real one. It reads rows from the slab and books
+//! from the sidecar and reconstructs elements from those bytes alone.
 //!
 //! # Two different position claims, deliberately separated
 //!
@@ -50,6 +65,9 @@
 
 use std::collections::HashMap;
 
+use lance_graph_contract::canonical_node::{EdgeBlock, NodeGuid, NodeRow, TailVariant};
+use osm_soa_bake::codebook::read_books;
+
 /// One element as the extract states it: position on OSM's grid, plus its tags
 /// in ordinal space.
 type Truth = (i32, i32, Vec<(u32, u32)>);
@@ -59,6 +77,38 @@ use osm_soa_bake::identity::read_identity;
 use osm_soa_bake::read::{self, OSM_NODE};
 use osm_soa_bake::row::{self, Keyed};
 use osm_soa_bake::tms;
+
+/// Load a slab file into an ALIGNED row vector.
+///
+/// `RowSlab` borrows `&[NodeRow]` out of a byte slice and rightly refuses one
+/// that is not 64-byte aligned — `NodeRow` is `#[repr(C, align(64))]`. An
+/// `mmap` satisfies that (page-aligned); a `Vec<u8>` from `fs::read` does not,
+/// and this verifier hit exactly that. Copying into a `Vec<NodeRow>` is the
+/// honest fix here: it is one pass over a cold artifact, and it keeps the
+/// alignment guarantee a type-level fact rather than a hope about the allocator.
+fn load_rows(path: &str) -> Vec<NodeRow> {
+    let bytes = std::fs::read(path).expect("read slab");
+    let stride = core::mem::size_of::<NodeRow>();
+    assert_eq!(
+        bytes.len() % stride,
+        0,
+        "slab is not a whole number of rows"
+    );
+    let blank = NodeRow {
+        key: NodeGuid::mint_for(TailVariant::V3, 0, 0, 0, 0, 0, 0, 0),
+        edges: EdgeBlock::default(),
+        value: [0u8; 480],
+    };
+    let mut rows = vec![blank; bytes.len() / stride];
+    // SAFETY: NodeRow is #[repr(C, align(64))] with a compile-asserted 512-byte
+    // size and no padding-dependent semantics — the canon defines the row AS
+    // its little-endian bytes, which is the same reason `bake` writes it this way.
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(rows.as_mut_ptr().cast::<u8>(), rows.len() * stride)
+    };
+    dst.copy_from_slice(&bytes);
+    rows
+}
 
 /// What one element looks like after being read back out of the bake.
 #[derive(Default)]
@@ -72,7 +122,7 @@ struct Recovered {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: parity <input.osm.pbf>");
+        eprintln!("usage: parity <input.osm.pbf> [<slab> <slab.books>]");
         std::process::exit(2);
     }
 
@@ -99,22 +149,43 @@ fn main() {
         );
     }
 
-    // ── The bake, exactly as `bake` runs it. ──
-    let mut keyed: Vec<Keyed> = features.iter().map(row::key_feature).collect();
+    // ── The rows to verify: from disk if given, else re-baked in-process. ──
+    let (book, rows): (_, Vec<NodeRow>) = if args.len() >= 4 {
+        let mut f = std::fs::File::open(&args[3]).expect("open codebooks");
+        let books = match read_books(&mut f) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("codebooks refused: {e}");
+                std::process::exit(1);
+            }
+        };
+        // The books on disk must be the books the bake used, or every
+        // ordinal addresses a neighbour. Digests are checked by read_books;
+        // this pins them against the freshly-read extract too.
+        if books.tag_keys.digest() != tags.keys.digest()
+            || books.tag_values.digest() != tags.values.digest()
+        {
+            eprintln!("tag codebooks on disk do not match this extract");
+            std::process::exit(1);
+        }
+        eprintln!("verifying the ARTIFACT: {} + {}", args[2], args[3]);
+        (books.identities, load_rows(&args[2]))
+    } else {
+        eprintln!("verifying the PIPELINE (no slab given) — weaker; see the module doc");
+        let mut keyed: Vec<Keyed> = features.iter().map(row::key_feature).collect();
+        row::expand_tag_overflow(&mut keyed);
+        keyed.sort_unstable_by_key(row::sort_key);
+        row::assign_identities(&mut keyed);
+        let book = row::resolve_identities(&mut keyed).expect("identity codebook");
+        let rows = keyed.iter().map(|k| row::build_row(k, &tags)).collect();
+        (book, rows)
+    };
     drop(features);
-    row::expand_tag_overflow(&mut keyed);
-    keyed.sort_unstable_by_key(row::sort_key);
-    row::assign_identities(&mut keyed);
-    let book = row::resolve_identities(&mut keyed).expect("identity codebook");
 
     // ── Read every row back, using ONLY its bytes and the codebooks. ──
-    //
-    // Nothing from `Keyed` leaks into this side except the row it produced —
-    // otherwise the check would be comparing the pipeline to itself.
-    let mut got: HashMap<u32, Recovered> = HashMap::with_capacity(keyed.len());
-    for k in &keyed {
-        let r = row::build_row(k, &tags);
-
+    let mut got: HashMap<u32, Recovered> = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        let r = *r;
         let (kind, ordinal) = match read_identity(&r) {
             Some(v) => v,
             None => {
