@@ -33,14 +33,30 @@
 
 use std::collections::HashMap;
 
+use ogar_vocab::class_ids;
 use osmpbf::{Element, ElementReader};
 
-/// OGAR concept ids for the OSM element kinds (`ogar_codebook`, geo domain
-/// `0x0F`). These land in the `EntityType` value tenant — the element's kind is
-/// a *class*, never a slot in the key (le-contract §2 slot purity).
-pub const OSM_NODE: u16 = 0x0F01;
-pub const OSM_WAY: u16 = 0x0F02;
-pub const OSM_RELATION: u16 = 0x0F03;
+/// OGAR concept ids for the OSM element kinds — **pulled** from
+/// [`ogar_vocab::class_ids`], never restated.
+///
+/// These were local literals (`0x0F01` …) until the plug-and-play rule was
+/// applied: a consumer pulls the codebook, it does not copy it. A copy is not
+/// merely redundant — it is a second source of truth that drifts silently,
+/// because nothing fails when upstream changes and the local literal does not.
+///
+/// The kind reaches a row as the **identity facet's classid**
+/// (`crate::identity`), not as a key tier — le-contract §2 slot purity: the
+/// element's kind is a *class*, never a slot in the key. (It previously landed
+/// in the `EntityType` value tenant; that lane was retired when the geo
+/// ClassView adopted the facet-slot reading of the value slab.)
+///
+/// [`OsmPort`](ogar_vocab::ports::OsmPort) is the port surface over the same
+/// ids; [`tests::the_port_and_these_constants_agree`] pins them together, so
+/// the port is the checked authority and these are a checked mirror rather
+/// than an independent declaration.
+pub const OSM_NODE: u16 = class_ids::OSM_NODE;
+pub const OSM_WAY: u16 = class_ids::OSM_WAY;
+pub const OSM_RELATION: u16 = class_ids::OSM_RELATION;
 
 /// A turn restriction is an `osm_relation` like any other — the OGAR codebook
 /// (geo domain `0x0F`) has no `osm_turn_restriction` concept, and inventing an
@@ -330,6 +346,24 @@ pub fn read_features(path: &str) -> Result<(Vec<Feature>, ReadStats), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ogar_vocab::ports::{OsmPort, PortSpec};
+
+    #[test]
+    fn the_port_and_these_constants_agree() {
+        // The plug-and-play pin. `OsmPort` is the authority — the Rails name a
+        // harvest produced, mapped to the minted concept — and the constants
+        // above are a mirror of it. Pulling both from `ogar-vocab` means this
+        // can only fail if the two upstream surfaces disagree with each other,
+        // which is the drift worth catching.
+        assert_eq!(OsmPort::class_id("Node"), Some(OSM_NODE));
+        assert_eq!(OsmPort::class_id("Way"), Some(OSM_WAY));
+        assert_eq!(OsmPort::class_id("Relation"), Some(OSM_RELATION));
+
+        // Anti-vacuity: the port genuinely discriminates rather than mapping
+        // every name to one id, and it refuses a name it does not carry.
+        assert_ne!(OsmPort::class_id("Node"), OsmPort::class_id("Way"));
+        assert_eq!(OsmPort::class_id("Tracepoint"), None);
+    }
 
     fn maps() -> (PosMap, PosMap) {
         // A junction at (13.40, 52.50) with two approach roads.
