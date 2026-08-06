@@ -1,10 +1,21 @@
 //! The 64k-row fragment — **64k files × 64k rows = 2³² rows = 2 TiB.**
 //!
 //! A fragment is exactly [`FRAGMENT_ROWS`] rows of [`NODE_ROW_STRIDE`] bytes:
-//! **32 MiB**. That size is not a tuning choice, it is what keeps the layout
-//! native to lance-graph — `SoaEnvelope::as_le_bytes` hands a row-strided LE
-//! packet, so a 64k-row file *is* a Lance fragment and its columnar I/O reads
-//! it unchanged.
+//! **32 MiB**.
+//!
+//! **This is the workspace's canonical frame, not a choice made here.**
+//! lance-graph `.claude/plans/measure-64k-axes-v1.md`: *"Canonical row: 512
+//! bytes; canonical frame: 65,536 × 512 B = 32 MiB."* Same figure in
+//! `dialectic-engine-v1.md` §258 (*"the 64k column (64k×512 B = 32 MB) is a
+//! cache convenience, server-L3-resident"*), and measured in the 1BRC probe
+//! lanes I/J at `grid=65536` (`crates/onebrc-probe`) — the same lane
+//! `stockfish-rs` cites as the "64×64 gridlake sweet spot". Everything in
+//! lancedb across this workspace is on 64k × 512 B; this crate adopts it
+//! rather than deriving it.
+//!
+//! It is also what keeps the layout native: `SoaEnvelope::as_le_bytes` hands a
+//! row-strided LE packet, so a 64k-row file is the unit Lance's columnar I/O
+//! already reads.
 //!
 //! # The two addresses
 //!
@@ -56,9 +67,19 @@ const _: () = assert!(
     "64k x 64k = 2^32 rows"
 );
 
-/// A row's physical address: which fragment, which row inside it.
+/// A row's address: which fragment, which row inside it.
 ///
-/// Packs to a `u32` — the whole point of fixing the fragment at 64k rows.
+/// **The row half is an ownership identity, not merely an offset.** The 1BRC
+/// lane-I probe states the correspondence directly: *"mailbox `i` owns row `i`
+/// of every 65536-row table by index correspondence"*
+/// (`lance-graph/crates/onebrc-probe/src/lane_i.rs`). A `u16` row index is a
+/// mailbox ordinal.
+///
+/// Packs to a `u32` — which is also the shape of
+/// `lance_graph_contract::collapse_gate::MailboxId`. Whether those are the
+/// same thing is an **open reconciliation upstream**, not something to assume:
+/// `le-contract.md` §5 records "MailboxId ≠ NiblePath in code … no conversion,
+/// no shared trait, no code comment linking them." Flagged, not unified here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowAddr {
     pub fragment: u16,
