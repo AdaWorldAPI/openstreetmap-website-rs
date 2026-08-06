@@ -59,7 +59,7 @@ fn main() {
     let mut keyed: Vec<row::Keyed> = features.iter().map(row::key_feature).collect();
     drop(features);
     let continuations = row::expand_tag_overflow(&mut keyed);
-    keyed.sort_unstable_by_key(|k| k.morton);
+    keyed.sort_unstable_by_key(row::sort_key);
     let collisions = row::assign_identities(&mut keyed);
     eprintln!(
         "keyed + sorted {} rows in {:.1}s",

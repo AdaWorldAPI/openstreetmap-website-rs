@@ -253,6 +253,22 @@ fn identity_key(k: &Keyed) -> String {
     format!("{:04x}:{}", k.entity_type, k.osm_id)
 }
 
+/// The bake's total row order: Morton first (trie order), then tag-span start.
+///
+/// Morton alone is NOT a total order here. A feature's continuation rows all
+/// carry the same Morton code, and `sort_unstable` gives no guarantee among
+/// equal keys — so the chunks of one feature's tag list could come out
+/// permuted, reassembling into the right multiset in the wrong sequence. That
+/// is exactly what the `parity` binary caught: 2,633 features with matching tag
+/// COUNTS and mismatched order.
+///
+/// Sorting on the span start too makes the layout deterministic, which is worth
+/// having on its own — two bakes of one extract should be byte-identical.
+#[must_use]
+pub fn sort_key(k: &Keyed) -> (u64, u32) {
+    (k.morton, k.tags.start)
+}
+
 /// Assign per-tile `identity` counters over a **Morton-sorted** slice, so a
 /// collision is a run of equal keys and needs no map. Returns the number of
 /// features that collided (identity > 0) — the falsifier for "z=32 makes a
