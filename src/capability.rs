@@ -237,8 +237,10 @@ mod tests {
 
         // A slab of one real row, and the tile that contains it.
         let k = key_feature(&crate::read::Feature {
-            lon: berlin.0,
-            lat: berlin.1,
+            anchor: crate::read::Anchor::Published {
+                lon: berlin.0,
+                lat: berlin.1,
+            },
             entity_type: crate::read::OSM_NODE,
             osm_id: 1,
             tags: crate::tags::TagSpan::default(),

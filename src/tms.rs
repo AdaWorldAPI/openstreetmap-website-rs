@@ -147,6 +147,99 @@ pub fn point_to_tiers(lon: f64, lat: f64) -> (u64, Tiers) {
     (code, tiers_of(code))
 }
 
+// ── Integer-native cells: the derived-anchor contract ───────────────
+//
+// A way or relation has no position OSM stores; this crate derives one. The
+// first version derived it in the f64 continuum — mean of member lon/lat — and
+// then compared the result against OSM's 1e-7 grid, which is the WRONG GRID for
+// a value that was never an OSM coordinate. That comparison could only ever
+// hold "within one step" (measured: 435,426 of 1,333,178 differed), and the
+// derivation carried a float that had to be reproduced bit-for-bit on every
+// platform for the key to be stable.
+//
+// The fix is to derive in the grid the key already uses. A member's cell is an
+// integer; the mean of integers under a FIXED rounding rule is an integer; so a
+// derived anchor is a grid point **by construction** rather than by tolerance.
+// The parity check becomes `assert_eq!` on integers, and the derivation
+// contains no float at all — deterministic across platforms without certifying
+// any transcendental kernel.
+//
+// The one float that remains is the ingest step ([`point_to_cell`]), which maps
+// a published coordinate to its cell. That is the same `merc_y` call a node
+// already pays, once per node, and it is the node contract's item — not this
+// one's.
+
+/// A z=32 tile, in the **XYZ** convention (`y` grows south).
+///
+/// The TMS flip is applied when the cell becomes a key ([`cell_to_morton`]), so
+/// arithmetic here stays in one convention and the flip happens exactly once —
+/// the Q3 ingest-boundary rule, honoured by having a single crossing point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub struct TileXy {
+    pub x: u32,
+    pub y_xyz: u32,
+}
+
+/// A published coordinate → its z=32 cell. **The ingest float.**
+#[must_use]
+pub fn point_to_cell(lon: f64, lat: f64) -> TileXy {
+    let (x, y_xyz) = lonlat_to_tile(lon, lat, HHTL_DEPTH4);
+    TileXy { x, y_xyz }
+}
+
+/// A cell → its TMS Morton key. Pure integer.
+#[must_use]
+pub fn cell_to_morton(c: TileXy) -> u64 {
+    morton64(c.x, xyz_to_tms_y(HHTL_DEPTH4, c.y_xyz))
+}
+
+/// A TMS Morton key → its cell. Pure integer, exact inverse of
+/// [`cell_to_morton`].
+#[must_use]
+pub fn morton_to_cell(code: u64) -> TileXy {
+    let (x, y_tms) = demorton64(code);
+    TileXy {
+        x,
+        y_xyz: xyz_to_tms_y(HHTL_DEPTH4, y_tms),
+    }
+}
+
+/// The derived-anchor rounding rule: **round half up**, per axis.
+///
+/// Fixed here, in the contract, rather than left to whatever integer division
+/// a call site happens to write. Either rule would do — what matters is that
+/// exactly one is named, versioned with the bake, and reproducible in any
+/// language. Half-up is chosen because "the nearest cell" is what *centroid*
+/// means; plain floor would systematically bias every derived anchor half a
+/// cell toward the origin.
+///
+/// No overflow: each term is below `2^32` and `n` is a member count, so the sum
+/// stays below `2^64` for any `n` this crate could ever see (a way caps around
+/// 2,000 refs).
+fn mean_axis(sum: u64, n: u64) -> u32 {
+    debug_assert!(n > 0, "mean_axis needs at least one member");
+    u32::try_from((sum + n / 2) / n).expect("a mean of u32 values fits a u32")
+}
+
+/// The integer centroid of a member set — a grid point **by construction**.
+///
+/// `None` for an empty set: a relation whose members all resolve to nothing has
+/// no anchor, and inventing `(0, 0)` would place it off West Africa while
+/// reading as valid. The caller counts those.
+#[must_use]
+pub fn mean_cell(cells: &[TileXy]) -> Option<TileXy> {
+    let n = u64::try_from(cells.len()).ok().filter(|&n| n > 0)?;
+    let (mut sx, mut sy) = (0u64, 0u64);
+    for c in cells {
+        sx += u64::from(c.x);
+        sy += u64::from(c.y_xyz);
+    }
+    Some(TileXy {
+        x: mean_axis(sx, n),
+        y_xyz: mean_axis(sy, n),
+    })
+}
+
 // ── The inverse: key → position ─────────────────────────────────────
 //
 // The key is only a *carrier* of the coordinate if the coordinate can be read
@@ -288,6 +381,78 @@ mod tests {
             morton_to_osm_grid(code),
             (lon_e7, lat_e7),
             "the key lost the OSM coordinate ({lon_e7}, {lat_e7})"
+        );
+    }
+
+    #[test]
+    fn a_cell_round_trips_through_the_key_with_no_float_at_all() {
+        // The derived-anchor contract: cell → key → cell is the identity, by
+        // integer arithmetic. This is what upgrades the way/relation check from
+        // "within one grid step" to `assert_eq!`.
+        for c in [
+            TileXy { x: 0, y_xyz: 0 },
+            TileXy { x: 1, y_xyz: 0 },
+            TileXy { x: 0, y_xyz: 1 },
+            TileXy {
+                x: u32::MAX,
+                y_xyz: u32::MAX,
+            },
+            point_to_cell(13.404_954, 52.520_008),
+            point_to_cell(-122.3472, 47.598),
+        ] {
+            assert_eq!(morton_to_cell(cell_to_morton(c)), c);
+        }
+        // …and it agrees with the float path for a real coordinate, so the two
+        // entry points cannot drift apart.
+        let (lon, lat) = (13.404_954, 52.520_008);
+        assert_eq!(
+            cell_to_morton(point_to_cell(lon, lat)),
+            point_to_tms_morton(lon, lat)
+        );
+    }
+
+    #[test]
+    fn the_integer_centroid_is_a_grid_point_and_rounds_half_up() {
+        // A single member is its own centroid.
+        let a = TileXy { x: 10, y_xyz: 20 };
+        assert_eq!(mean_cell(&[a]), Some(a));
+
+        // Two members average exactly.
+        let b = TileXy { x: 20, y_xyz: 40 };
+        assert_eq!(mean_cell(&[a, b]), Some(TileXy { x: 15, y_xyz: 30 }));
+
+        // The rounding rule is HALF UP, and it is genuinely exercised: 10 and
+        // 11 average to 10.5. Floor would give 10; the contract says 11.
+        let c = TileXy { x: 11, y_xyz: 21 };
+        assert_eq!(
+            mean_cell(&[a, c]),
+            Some(TileXy { x: 11, y_xyz: 21 }),
+            "half-up: 10.5 -> 11, not 10"
+        );
+
+        // Empty means no anchor, never (0, 0) — which would sit off West
+        // Africa and read as a valid position.
+        assert_eq!(mean_cell(&[]), None);
+    }
+
+    #[test]
+    fn the_integer_centroid_does_not_overflow_at_the_top_of_the_grid() {
+        // Every member at the maximum cell: a u32-summing implementation would
+        // wrap here and place the anchor near the origin.
+        let top = TileXy {
+            x: u32::MAX,
+            y_xyz: u32::MAX,
+        };
+        let many = vec![top; 4096];
+        assert_eq!(mean_cell(&many), Some(top));
+        // Mixed extremes average without wrapping either.
+        let mixed = vec![top, TileXy { x: 0, y_xyz: 0 }];
+        assert_eq!(
+            mean_cell(&mixed),
+            Some(TileXy {
+                x: 2_147_483_648,
+                y_xyz: 2_147_483_648
+            })
         );
     }
 

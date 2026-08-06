@@ -92,7 +92,11 @@ pub struct Keyed {
 /// Key a feature: TMS Morton at z=32 → four cascade tiers.
 #[must_use]
 pub fn key_feature(f: &Feature) -> Keyed {
-    let (morton, tiers) = tms::point_to_tiers(f.lon, f.lat);
+    // The anchor decides which contract applies; `cell()` is the one place the
+    // published-vs-derived distinction is resolved, and for a derived anchor it
+    // is pure integer — no float reaches the key.
+    let morton = tms::cell_to_morton(f.anchor.cell());
+    let tiers = tms::tiers_of(morton);
     Keyed {
         morton,
         tiers,
@@ -303,8 +307,7 @@ mod tests {
 
     fn feat(lon: f64, lat: f64) -> Feature {
         Feature {
-            lon,
-            lat,
+            anchor: crate::read::Anchor::Published { lon, lat },
             entity_type: crate::read::OSM_WAY,
             osm_id: 1,
             tags: crate::tags::TagSpan::default(),
@@ -366,15 +369,19 @@ mod tests {
         // valid.
         let mut batch = [
             key_feature(&Feature {
-                lon: 13.4,
-                lat: 52.5,
+                anchor: crate::read::Anchor::Published {
+                    lon: 13.4,
+                    lat: 52.5,
+                },
                 entity_type: crate::read::OSM_NODE,
                 osm_id: 42,
                 tags: crate::tags::TagSpan::default(),
             }),
             key_feature(&Feature {
-                lon: 13.4,
-                lat: 52.5,
+                anchor: crate::read::Anchor::Published {
+                    lon: 13.4,
+                    lat: 52.5,
+                },
                 entity_type: crate::read::OSM_WAY,
                 osm_id: 42,
                 tags: crate::tags::TagSpan::default(),
