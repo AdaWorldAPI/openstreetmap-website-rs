@@ -204,6 +204,44 @@ pub fn morton_to_cell(code: u64) -> TileXy {
     }
 }
 
+/// How [`mean_cell`] rounds — part of the **artifact contract**, not an
+/// implementation detail.
+///
+/// A derived anchor is only reproducible if the rounding rule is known, so the
+/// rule travels with the bake (the codebook sidecar's header carries this
+/// discriminant) instead of living only in Rust doc-comments. A reader in
+/// another language reads the contract rather than reconstructing it.
+///
+/// Wire values are stable and `0` is deliberately not one of them: an
+/// unspecified rule must be refused, never defaulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AnchorRounding {
+    /// `(Σ + n/2) / n` — the rule this crate bakes with.
+    HalfUp = 1,
+}
+
+impl AnchorRounding {
+    /// The rule in force. A bake stamps this; a reader checks it.
+    pub const CURRENT: AnchorRounding = AnchorRounding::HalfUp;
+
+    /// The stable wire value.
+    #[must_use]
+    pub const fn wire(self) -> u32 {
+        self as u32
+    }
+
+    /// A wire value back to a rule. `None` for `0` (unspecified) or anything
+    /// this build does not implement — refused, never defaulted.
+    #[must_use]
+    pub const fn from_wire(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(AnchorRounding::HalfUp),
+            _ => None,
+        }
+    }
+}
+
 /// The derived-anchor rounding rule: **round half up**, per axis.
 ///
 /// Fixed here, in the contract, rather than left to whatever integer division

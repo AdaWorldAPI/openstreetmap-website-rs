@@ -75,7 +75,7 @@
 use std::collections::HashMap;
 
 use lance_graph_contract::canonical_node::{EdgeBlock, NodeGuid, NodeRow, TailVariant};
-use osm_soa_bake::codebook::read_books;
+use osm_soa_bake::codebook::{read_books, verify_slab};
 
 /// One element as the extract states it: its anchor under whichever contract
 /// applies, plus its tags in ordinal space.
@@ -95,9 +95,7 @@ use osm_soa_bake::tms;
 /// and this verifier hit exactly that. Copying into a `Vec<NodeRow>` is the
 /// honest fix here: it is one pass over a cold artifact, and it keeps the
 /// alignment guarantee a type-level fact rather than a hope about the allocator.
-fn load_rows(path: &str) -> Vec<NodeRow> {
-    let bytes = std::fs::read(path).expect("read slab");
-    let stride = core::mem::size_of::<NodeRow>();
+fn load_rows_from(bytes: &[u8], stride: usize) -> Vec<NodeRow> {
     assert_eq!(
         bytes.len() % stride,
         0,
@@ -115,7 +113,7 @@ fn load_rows(path: &str) -> Vec<NodeRow> {
     let dst = unsafe {
         core::slice::from_raw_parts_mut(rows.as_mut_ptr().cast::<u8>(), rows.len() * stride)
     };
-    dst.copy_from_slice(&bytes);
+    dst.copy_from_slice(bytes);
     rows
 }
 
@@ -161,7 +159,7 @@ fn main() {
     // ── The rows to verify: from disk if given, else re-baked in-process. ──
     let (book, rows): (_, Vec<NodeRow>) = if args.len() >= 4 {
         let mut f = std::fs::File::open(&args[3]).expect("open codebooks");
-        let books = match read_books(&mut f) {
+        let (header, books) = match read_books(&mut f) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("codebooks refused: {e}");
@@ -178,7 +176,35 @@ fn main() {
             std::process::exit(1);
         }
         eprintln!("verifying the ARTIFACT: {} + {}", args[2], args[3]);
-        (books.identities, load_rows(&args[2]))
+        // The marriage test: row count and digest, before a single element is
+        // reconstructed. Two individually-valid artifacts from different bakes
+        // read cleanly and resolve every ordinal to a plausible NEIGHBOUR, so
+        // this has to run first or the parity result below is meaningless.
+        let slab_bytes = std::fs::read(&args[2]).expect("read slab");
+        let stride = core::mem::size_of::<NodeRow>();
+        if let Err(e) = verify_slab(&header, &slab_bytes, stride) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        let rows = load_rows_from(&slab_bytes, stride);
+
+        // The occupancy guard: what the bake said it wrote must be what is
+        // there. Note this comparison alone would NOT catch a bake that wrote
+        // nothing — zero equals zero — which is why `bake` REFUSES that case
+        // outright. This catches truncation and partial writes.
+        let actual: u64 = rows.iter().map(|r| cluster::filled_slots(r) as u64).sum();
+        if actual != header.slots_written {
+            eprintln!(
+                "occupancy mismatch: sidecar records {} filled slots, slab has {actual}",
+                header.slots_written
+            );
+            std::process::exit(1);
+        }
+        eprintln!(
+            "artifact pinned: {} rows, {} slots, rounding {:?}",
+            header.rows, header.slots_written, header.rounding
+        );
+        (books.identities, rows)
     } else {
         eprintln!("verifying the PIPELINE (no slab given) — weaker; see the module doc");
         let mut keyed: Vec<Keyed> = features.iter().map(row::key_feature).collect();
