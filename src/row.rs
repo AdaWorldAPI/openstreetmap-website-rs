@@ -8,6 +8,7 @@
 //! `tenants.md` names that exact drift and its three stale-offset incidents.)
 
 use lance_graph_contract::canonical_node::{EdgeBlock, NodeGuid, NodeRow, TailVariant};
+use lance_graph_contract::identity_quad::{CodebookError, IdentityCodebook};
 
 use crate::read::Feature;
 use crate::tms::{self, Tiers};
@@ -41,10 +42,15 @@ pub struct Keyed {
     pub morton: u64,
     pub tiers: Tiers,
     pub entity_type: u16,
-    /// The upstream OSM element id, carried into the row's identity facet.
-    /// Harvested for every element kind in `read.rs`; before this field
-    /// existed it died here, which blocked any round-trip to upstream OSM.
+    /// The upstream OSM element id, harvested for every element kind in
+    /// `read.rs`. It is **not** written to the row: a raw id needs 34 bits and
+    /// the identity tenant's slots are `u24`. It is kept here so the pre-bake
+    /// stage can build the codebook that turns it into [`Self::identity_ordinal`].
     pub osm_id: i64,
+    /// The codebook ordinal for [`Self::osm_id`], assigned **pre-bake** by
+    /// [`resolve_identities`]. `None` until that stage runs — a row built
+    /// without it carries no identity rather than a wrong one.
+    pub identity_ordinal: Option<u32>,
     pub identity: u16,
 }
 
@@ -57,6 +63,7 @@ pub fn key_feature(f: &Feature) -> Keyed {
         tiers,
         entity_type: f.entity_type,
         osm_id: f.osm_id,
+        identity_ordinal: None,
         identity: 0,
     }
 }
@@ -102,14 +109,51 @@ pub fn build_row(k: &Keyed) -> NodeRow {
         edges: EdgeBlock::default(),
         value: [0u8; 480],
     };
-    let wrote = crate::identity::write_identity(&mut row, k.entity_type, k.osm_id);
-    debug_assert!(
-        wrote,
-        "entity_type {:#06x} is not a Geo concept — the bake must not key a \
-         row it cannot identify",
-        k.entity_type
-    );
+    if let Some(ordinal) = k.identity_ordinal {
+        let wrote = crate::identity::write_identity(&mut row, k.entity_type, ordinal);
+        debug_assert!(
+            wrote,
+            "entity_type {:#06x} / ordinal {ordinal} was refused — the bake \
+             must not key a row it cannot identify",
+            k.entity_type
+        );
+    }
     row
+}
+
+/// The **pre-bake** identity stage: build the codebook from every observed
+/// `osm_id` and stamp each row's ordinal.
+///
+/// This is the stage lance-graph PR #902 names — *"the identities are resolved
+/// **before** the bake, and the bake places all four into one V3 facet
+/// payload"* — so that a read is a fixed-offset register read with no join.
+/// `build_row` is pure layout and never resolves anything.
+///
+/// Keys are `"{kind:04x}:{osm_id}"`, kind-qualified because OSM ids are only
+/// unique **within** an element type: node 42 and way 42 are different
+/// elements, and an unqualified key would collide them into one ordinal —
+/// which `IdentityCodebook` would then reject as non-injective, turning a
+/// silent identity merge into a loud refusal.
+///
+/// # Errors
+///
+/// Returns the codebook's own error when the distinct-key count exceeds
+/// `MAX_ENTRIES` — refused rather than truncated, per #902's
+/// refuse-don't-widen discipline.
+pub fn resolve_identities(keyed: &mut [Keyed]) -> Result<IdentityCodebook, CodebookError> {
+    let mut keys: Vec<String> = keyed.iter().map(identity_key).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let book = IdentityCodebook::try_new(keys)?;
+    for k in keyed.iter_mut() {
+        k.identity_ordinal = book.ordinal(&identity_key(k));
+    }
+    Ok(book)
+}
+
+/// The codebook key for one feature — kind-qualified (see [`resolve_identities`]).
+fn identity_key(k: &Keyed) -> String {
+    format!("{:04x}:{}", k.entity_type, k.osm_id)
 }
 
 /// Assign per-tile `identity` counters over a **Morton-sorted** slice, so a
@@ -172,6 +216,50 @@ mod tests {
     }
 
     #[test]
+    fn the_codebook_key_is_kind_qualified_so_node_42_and_way_42_stay_distinct() {
+        // OSM ids are unique only WITHIN an element type. An unqualified key
+        // would map node 42 and way 42 to one ordinal — a silent identity
+        // merge, the worst class of bug here because both rows still read as
+        // valid.
+        let mut batch = [
+            key_feature(&Feature {
+                lon: 13.4,
+                lat: 52.5,
+                entity_type: crate::read::OSM_NODE,
+                osm_id: 42,
+            }),
+            key_feature(&Feature {
+                lon: 13.4,
+                lat: 52.5,
+                entity_type: crate::read::OSM_WAY,
+                osm_id: 42,
+            }),
+        ];
+        resolve_identities(&mut batch).expect("two keys fit");
+        let (a, b) = (batch[0].identity_ordinal, batch[1].identity_ordinal);
+        assert!(a.is_some() && b.is_some(), "both must resolve");
+        assert_ne!(a, b, "same id, different kind must not share an ordinal");
+
+        // Anti-vacuity: the SAME (kind, id) twice DOES share an ordinal, so
+        // the distinction is the kind and not "every row gets a fresh number".
+        let mut same = [batch[0], batch[0]];
+        resolve_identities(&mut same).expect("one distinct key fits");
+        assert_eq!(same[0].identity_ordinal, same[1].identity_ordinal);
+    }
+
+    #[test]
+    fn a_row_built_before_the_pre_bake_stage_carries_no_identity_at_all() {
+        // `build_row` is pure layout: without a resolved ordinal it must leave
+        // the slot dormant rather than invent one. A fabricated identity would
+        // point at the wrong element and still read as valid.
+        let k = key_feature(&feat(13.404954, 52.520008));
+        assert_eq!(k.identity_ordinal, None);
+        let row = build_row(&k);
+        assert_eq!(crate::identity::read_identity(&row), None);
+        assert_eq!(row.value, [0u8; 480], "no slot may be written");
+    }
+
+    #[test]
     fn the_kind_lands_in_the_identity_slot_and_the_entity_type_lane_stays_dormant() {
         // RE-PINNED (was `entity_type_lands_in_its_tenant_and_nowhere_else`).
         // The old test asserted the kind at `ValueTenant::EntityType`'s offset.
@@ -183,13 +271,22 @@ mod tests {
         // claim survived the change — only its address moved.
         let mut k = key_feature(&feat(13.404954, 52.520008));
         k.entity_type = crate::read::OSM_WAY;
-        k.osm_id = 4_294_967_297; // > u32::MAX, so a 32-bit read would corrupt it
-        let row = build_row(&k);
+        // A real ~2^34 OSM id — far past u24, which is exactly why it must go
+        // through the codebook rather than into the slot.
+        k.osm_id = 12_000_000_001;
+        let mut batch = [k];
+        let book = resolve_identities(&mut batch).expect("one key fits the book");
+        let row = build_row(&batch[0]);
 
-        // The kind + id are recoverable from the slot alone.
+        // The kind + ordinal are recoverable from the slot alone, and the
+        // ordinal pulls back to the original id through the codebook — the
+        // round-trip #902 calls the tenant's acceptance criterion.
+        let (kind, ordinal) = crate::identity::read_identity(&row).expect("identity written");
+        assert_eq!(kind, crate::read::OSM_WAY);
         assert_eq!(
-            crate::identity::read_identity(&row),
-            Some((crate::read::OSM_WAY, 4_294_967_297))
+            book.key(ordinal),
+            Some(format!("{:04x}:{}", crate::read::OSM_WAY, 12_000_000_001i64).as_str()),
+            "the ordinal must pull back to the id it was minted from"
         );
 
         // And the EntityType lane is NOT written — the switch really happened.
