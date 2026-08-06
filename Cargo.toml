@@ -47,3 +47,7 @@ path = "src/bin/tier_probe.rs"
 [[bin]]
 name = "parity"
 path = "src/bin/parity.rs"
+
+[[bin]]
+name = "slab_stats"
+path = "src/bin/slab_stats.rs"
