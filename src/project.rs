@@ -100,6 +100,7 @@ mod tests {
             morton: code,
             tiers: tiers_of(code),
             entity_type: crate::read::OSM_WAY,
+            osm_id: 0,
             identity: 0,
         })
     }

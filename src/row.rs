@@ -2,14 +2,12 @@
 //!
 //! The row layout is `lance_graph_contract::canonical_node::NodeRow`, locked
 //! 2026-06-13. Nothing here invents a byte position: the key is minted through
-//! `NodeGuid::mint_for`, and the one value lane written is addressed through
-//! `ValueTenant::value_offset()` — never a literal offset. (q2's `osint-bake`
+//! `NodeGuid::mint_for`, and the value slab is addressed by **slot index**
+//! through `crate::identity` — never a literal offset. (q2's `osint-bake`
 //! pokes slab byte 0 by literal, which lands inside the `Meta` tenant's range;
 //! `tenants.md` names that exact drift and its three stale-offset incidents.)
 
-use lance_graph_contract::canonical_node::{
-    EdgeBlock, NodeGuid, NodeRow, TailVariant, ValueTenant,
-};
+use lance_graph_contract::canonical_node::{EdgeBlock, NodeGuid, NodeRow, TailVariant};
 
 use crate::read::Feature;
 use crate::tms::{self, Tiers};
@@ -43,6 +41,10 @@ pub struct Keyed {
     pub morton: u64,
     pub tiers: Tiers,
     pub entity_type: u16,
+    /// The upstream OSM element id, carried into the row's identity facet.
+    /// Harvested for every element kind in `read.rs`; before this field
+    /// existed it died here, which blocked any round-trip to upstream OSM.
+    pub osm_id: i64,
     pub identity: u16,
 }
 
@@ -54,6 +56,7 @@ pub fn key_feature(f: &Feature) -> Keyed {
         morton,
         tiers,
         entity_type: f.entity_type,
+        osm_id: f.osm_id,
         identity: 0,
     }
 }
@@ -63,12 +66,25 @@ pub fn key_feature(f: &Feature) -> Keyed {
 /// - **key** — `classid | heel | hip | twig | leaf | family | identity`.
 ///   `family = 0` deliberately: the CANON zero-fallback ladder reads a zero
 ///   family as *"default basin, no neighbourhood grouping"*, and the feature's
-///   kind belongs in `EntityType` + the ClassView, never in a key tier
+///   kind belongs in the value slab + the ClassView, never in a key tier
 ///   (le-contract §2). `identity` only breaks a same-tile collision.
 /// - **edges** — zeroed. Reserved, never shrunk; a class opting out of edges is
 ///   resolved via `classid → ClassView`, never by a stride change.
-/// - **value** — `EntityType` only. Every other lane stays zero per
-///   RESERVE-DON'T-RECLAIM; a dormant lane is *not consulted*, not compacted.
+/// - **value** — the **identity facet in slot 2**, and nothing else. Every
+///   other slot stays zero per RESERVE-DON'T-RECLAIM; a dormant slot is *not
+///   consulted*, not compacted.
+///
+/// # The value slab is read as SLOTS here, not as tenant lanes
+///
+/// The 480 bytes have two readings — [`ValueTenant`] lanes, or 30 uniform
+/// `classid(4) + 12` facet slots — and they **overlap byte-for-byte** (slot 2
+/// is exactly `Meta ++ Qualia`). A class picks one; a geo row picks slots.
+///
+/// So `EntityType` is deliberately **no longer written**. The element's kind
+/// is the identity slot's own classid (`geo_identity_classid`), which makes
+/// the slot readable standalone — and writing the kind a second time into a
+/// tenant lane would store one fact twice under two incompatible readings.
+/// That is a drift generator, not redundancy. See `crate::identity`.
 #[must_use]
 pub fn build_row(k: &Keyed) -> NodeRow {
     let key = NodeGuid::mint_for(
@@ -81,16 +97,19 @@ pub fn build_row(k: &Keyed) -> NodeRow {
         0,
         u32::from(k.identity),
     );
-    let mut value = [0u8; 480];
-    let off = ValueTenant::EntityType.value_offset();
-    let len = ValueTenant::EntityType.byte_len();
-    debug_assert_eq!(len, 2, "EntityType is a U16 lane");
-    value[off..off + len].copy_from_slice(&k.entity_type.to_le_bytes());
-    NodeRow {
+    let mut row = NodeRow {
         key,
         edges: EdgeBlock::default(),
-        value,
-    }
+        value: [0u8; 480],
+    };
+    let wrote = crate::identity::write_identity(&mut row, k.entity_type, k.osm_id);
+    debug_assert!(
+        wrote,
+        "entity_type {:#06x} is not a Geo concept — the bake must not key a \
+         row it cannot identify",
+        k.entity_type
+    );
+    row
 }
 
 /// Assign per-tile `identity` counters over a **Morton-sorted** slice, so a
@@ -116,7 +135,7 @@ pub fn assign_identities(keyed: &mut [Keyed]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_graph_contract::canonical_node::NODE_ROW_STRIDE;
+    use lance_graph_contract::canonical_node::{ValueTenant, NODE_ROW_STRIDE};
 
     fn feat(lon: f64, lat: f64) -> Feature {
         Feature {
@@ -153,25 +172,44 @@ mod tests {
     }
 
     #[test]
-    fn entity_type_lands_in_its_tenant_and_nowhere_else() {
-        // Field isolation (I-LEGACY-API-FEATURE-GATED): writing one lane must
-        // leave every other byte of the slab zero.
+    fn the_kind_lands_in_the_identity_slot_and_the_entity_type_lane_stays_dormant() {
+        // RE-PINNED (was `entity_type_lands_in_its_tenant_and_nowhere_else`).
+        // The old test asserted the kind at `ValueTenant::EntityType`'s offset.
+        // That reading is gone: a geo row reads its value slab as 30 facet
+        // SLOTS, and the two readings overlap byte-for-byte, so a row cannot
+        // hold both. The kind is now the identity slot's own classid.
+        //
+        // Kept as an assertion rather than deleted, because the interesting
+        // claim survived the change — only its address moved.
         let mut k = key_feature(&feat(13.404954, 52.520008));
         k.entity_type = crate::read::OSM_WAY;
+        k.osm_id = 4_294_967_297; // > u32::MAX, so a 32-bit read would corrupt it
         let row = build_row(&k);
-        let off = ValueTenant::EntityType.value_offset();
+
+        // The kind + id are recoverable from the slot alone.
         assert_eq!(
-            u16::from_le_bytes([row.value[off], row.value[off + 1]]),
-            crate::read::OSM_WAY
+            crate::identity::read_identity(&row),
+            Some((crate::read::OSM_WAY, 4_294_967_297))
         );
+
+        // And the EntityType lane is NOT written — the switch really happened.
+        let old = ValueTenant::EntityType.value_offset();
+        assert_eq!(
+            u16::from_le_bytes([row.value[old], row.value[old + 1]]),
+            0,
+            "the EntityType lane must stay dormant; the kind is the slot classid"
+        );
+
+        // Field isolation (I-LEGACY-API-FEATURE-GATED): only slot 2 is written.
+        let slot = crate::identity::slab_offset_of_slot(ogar_osm::GEO_IDENTITY_SLOT).unwrap();
         let others: usize = row
             .value
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != off && *i != off + 1)
+            .filter(|(i, _)| !(slot..slot + crate::identity::SLOT_BYTES).contains(i))
             .map(|(_, b)| usize::from(*b))
             .sum();
-        assert_eq!(others, 0, "no lane but EntityType may be written");
+        assert_eq!(others, 0, "no slot but the identity facet may be written");
     }
 
     #[test]

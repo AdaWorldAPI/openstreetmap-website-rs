@@ -193,6 +193,7 @@ mod tests {
                 morton: c,
                 tiers: tiers_of(c),
                 entity_type: crate::read::OSM_NODE,
+                osm_id: 0,
                 identity: 0,
             };
             let r = build_row(&k);
