@@ -33,6 +33,24 @@ lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", fe
 ogar-osm = { git = "https://github.com/AdaWorldAPI/OGAR.git", branch = "main" }
 ogar-vocab = { git = "https://github.com/AdaWorldAPI/OGAR.git", branch = "main" }
 
+# The Lance ABI seam (feature `lance`) — hydration + versioning for the slab.
+# OFF by default so the `bake` binary keeps the lean dependency set the header
+# of this file declares; the lancedb tree is only pulled when a consumer wants
+# the dataset form. Versions track lance-graph's own lockstep pins (lance 9 /
+# lancedb 0.33 / arrow 58) — a bump here is a bump there, never a drift.
+arrow = { version = "58", optional = true }
+lancedb = { version = "=0.33.0", optional = true, default-features = false }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# Only the `lance` feature's tests need an async runtime and a scratch dir.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+
+[features]
+default = []
+lance = ["dep:arrow", "dep:lancedb", "dep:futures"]
+
 [[bin]]
 name = "bake"
 path = "src/bin/bake.rs"
