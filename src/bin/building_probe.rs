@@ -19,6 +19,11 @@
 //! 3. **Shared-wall incidence** — how many building ways share a whole edge with
 //!    a neighbour. Falsifier: high *together with* a high (2) → the template
 //!    needs a shared-edge form before it ships, or duplication must be priced.
+//! 4. **Encoded size** — §2(c) quotes "anchor + θ + two lengths ≈ 14 B against
+//!    5 nodes × 8 B". That is arithmetic for a rectangle, and column (2) shows
+//!    only 45.6 % of footprints are rectangles; the rest have more corners and
+//!    therefore more varints. This column measures the encoding over the real
+//!    distribution instead of quoting the best case.
 //!
 //! # Angles are measured in cell space, and that is not a shortcut
 //!
@@ -65,6 +70,22 @@ fn cell_metres(lat: f64) -> f64 {
     EQUATORIAL_M / 4_294_967_296.0 * lat.to_radians().cos()
 }
 
+/// Bytes an LEB128 varint of `v` occupies.
+fn varint_len(v: u64) -> usize {
+    let mut n = 1;
+    let mut v = v >> 7;
+    while v > 0 {
+        n += 1;
+        v >>= 7;
+    }
+    n
+}
+
+/// Zig-zag, so a signed delta costs by magnitude rather than by sign.
+fn zigzag(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
 /// Quantile of a sorted slice.
 fn q(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
@@ -79,6 +100,13 @@ struct Fit {
     corners: usize,
     /// Worst per-edge displacement from a perfectly rectilinear footprint.
     worst_m: f64,
+    /// Bytes the §2(c) turn-bit encoding would spend on this footprint:
+    /// θ as `u16`, one turn bit per corner, one length varint per edge.
+    ///
+    /// The anchor is NOT counted — it is the row's key, which the footprint
+    /// already has. Counting it would charge the template for storage the bake
+    /// pays regardless.
+    encoded_b: usize,
     /// Longest edge, metres — the size the verdict must be stratified by.
     ///
     /// The threshold is a DISPLACEMENT, so a given angular error passes more
@@ -142,9 +170,19 @@ fn rectilinear_fit(pts: &[(f64, f64)]) -> Option<Fit> {
         let dev = d.min(quarter - d);
         worst = worst.max(len * dev.sin() * m_per_cell);
     }
+    // θ (u16) + ceil(corners/8) turn bits + a length varint per edge, in cells
+    // — the unit the encoding would actually store, not metres.
+    let encoded_b = 2
+        + ring.len().div_ceil(8)
+        + edges
+            .iter()
+            .map(|&(_, len)| varint_len(len.round() as u64))
+            .sum::<usize>();
+
     Some(Fit {
         corners: ring.len(),
         worst_m: worst,
+        encoded_b,
         longest_m: edges.iter().map(|&(_, l)| l).fold(0.0, f64::max) * m_per_cell,
     })
 }
@@ -185,6 +223,8 @@ fn main() {
     let mut fits: Vec<f64> = Vec::with_capacity(600_000);
     // (longest edge, worst displacement) so the verdict can be stratified.
     let mut sized: Vec<(f64, f64)> = Vec::with_capacity(600_000);
+    // (encoded bytes, raw-id-list bytes, pbf-style delta-varint bytes)
+    let mut costs: Vec<(u64, u64, u64)> = Vec::with_capacity(600_000);
     let mut rectangles = 0u64;
     let mut degenerate = 0u64;
 
@@ -246,6 +286,28 @@ fn main() {
                     }
                     fits.push(f.worst_m);
                     sized.push((f.longest_m, f.worst_m));
+
+                    // Baseline A — what a row-based store pays for the node
+                    // list: one raw i64 id per node. This is §2(c)'s "5 nodes
+                    // × 8 B".
+                    let raw = ids.len() as u64 * 8;
+                    // Baseline B — what the PBF actually spends: delta-encoded
+                    // zig-zag varints for id, lat and lon along the way. The
+                    // honest comparison, because the format being replaced is
+                    // not naive.
+                    let mut pbf = 0u64;
+                    let (mut pid, mut plat, mut plon) = (0i64, 0i64, 0i64);
+                    for (i, &id) in ids.iter().enumerate() {
+                        let (lon, lat) = pts[i];
+                        let (la, lo) = ((lat * 1e7).round() as i64, (lon * 1e7).round() as i64);
+                        pbf += varint_len(zigzag(id - pid)) as u64
+                            + varint_len(zigzag(la - plat)) as u64
+                            + varint_len(zigzag(lo - plon)) as u64;
+                        pid = id;
+                        plat = la;
+                        plon = lo;
+                    }
+                    costs.push((f.encoded_b as u64, raw, pbf));
                 }
                 None => degenerate += 1,
             }
@@ -345,6 +407,41 @@ fn main() {
             pct(ok, band.len() as u64)
         );
     }
+    println!();
+
+    // ── Column (iv): encoded size, over the real corner distribution. ──
+    let mut enc: Vec<u64> = costs.iter().map(|c| c.0).collect();
+    enc.sort_unstable();
+    let sum_enc: u64 = costs.iter().map(|c| c.0).sum();
+    let sum_raw: u64 = costs.iter().map(|c| c.1).sum();
+    let sum_pbf: u64 = costs.iter().map(|c| c.2).sum();
+    let encf: Vec<f64> = enc.iter().map(|&v| v as f64).collect();
+    println!("── P4(iv): turn-bit encoding size vs what it replaces ──");
+    println!("footprints priced     {:>12}", costs.len());
+    println!("encoded bytes per footprint (θ + turn bits + length varints):");
+    println!("  median              {:>12.0} B", q(&encf, 0.5));
+    println!("  p95                 {:>12.0} B", q(&encf, 0.95));
+    println!(
+        "  max                 {:>12.0} B",
+        encf.last().copied().unwrap_or(0.0)
+    );
+    println!(
+        "TOTAL encoded         {:>12}  ({:.1} MB)",
+        sum_enc,
+        sum_enc as f64 / 1048576.0
+    );
+    println!(
+        "  vs raw id list      {:>12}  ({:.1} MB)  → {:.2}x smaller",
+        sum_raw,
+        sum_raw as f64 / 1048576.0,
+        sum_raw as f64 / sum_enc.max(1) as f64
+    );
+    println!(
+        "  vs PBF delta-varint {:>12}  ({:.1} MB)  → {:.2}x smaller",
+        sum_pbf,
+        sum_pbf as f64 / 1048576.0,
+        sum_pbf as f64 / sum_enc.max(1) as f64
+    );
     println!();
 
     // ── Column (iii): shared walls. ──
