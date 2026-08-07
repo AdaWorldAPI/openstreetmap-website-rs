@@ -63,3 +63,7 @@ path = "src/bin/wayclass_probe.rs"
 [[bin]]
 name = "areal_probe"
 path = "src/bin/areal_probe.rs"
+
+[[bin]]
+name = "graph_probe"
+path = "src/bin/graph_probe.rs"
