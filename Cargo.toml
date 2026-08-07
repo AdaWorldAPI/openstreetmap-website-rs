@@ -63,3 +63,23 @@ path = "src/bin/wayclass_probe.rs"
 [[bin]]
 name = "areal_probe"
 path = "src/bin/areal_probe.rs"
+
+[[bin]]
+name = "graph_probe"
+path = "src/bin/graph_probe.rs"
+
+[[bin]]
+name = "corridor_probe"
+path = "src/bin/corridor_probe.rs"
+
+[[bin]]
+name = "addr_probe"
+path = "src/bin/addr_probe.rs"
+
+[[bin]]
+name = "housenum_probe"
+path = "src/bin/housenum_probe.rs"
+
+[[bin]]
+name = "junction_probe"
+path = "src/bin/junction_probe.rs"
