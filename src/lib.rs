@@ -9,6 +9,7 @@
 pub mod capability;
 pub mod cluster;
 pub mod codebook;
+pub mod curve;
 pub mod fragment;
 pub mod geodesy;
 pub mod identity;
