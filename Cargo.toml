@@ -79,3 +79,7 @@ path = "src/bin/addr_probe.rs"
 [[bin]]
 name = "housenum_probe"
 path = "src/bin/housenum_probe.rs"
+
+[[bin]]
+name = "junction_probe"
+path = "src/bin/junction_probe.rs"
