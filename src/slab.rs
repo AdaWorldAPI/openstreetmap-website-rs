@@ -84,8 +84,10 @@ impl<'a> RowSlab<'a> {
     /// An earlier version demanded `NodeRow`'s 64-byte alignment at
     /// construction. That made the whole slab unusable over a buffer a real
     /// producer hands back: **Lance's read path gives no alignment guarantee**
-    /// — 8-byte aligned, sometimes 64 by luck of allocator state, measured in
-    /// `lance_abi::tests::the_lance_read_path_gives_no_alignment_guarantee`.
+    /// — 8-byte aligned, sometimes 64 by luck of allocator state. Measured
+    /// against a real dataset before that measurement's module was removed;
+    /// the finding survives the module because it is about arrow and Lance,
+    /// not about anything this crate wrote.
     ///
     /// The check was in the wrong place. **Nothing the slab does for a LOOKUP
     /// needs the cast:** [`morton_at`](Self::morton_at) reads bytes at computed

@@ -13,9 +13,6 @@ pub mod curve;
 pub mod fragment;
 pub mod geodesy;
 pub mod identity;
-/// The Lance ABI seam — the slab as a dataset (feature `lance`).
-#[cfg(feature = "lance")]
-pub mod lance_abi;
 pub mod project;
 pub mod read;
 pub mod row;
