@@ -1617,8 +1617,11 @@ fn main() {
     println!("  \"cover\" = share of the class's vertices living on a chain long enough to fit.");
 
     println!("\n(x) the RENDERING budget — what crosses the wire, not what fits");
-    println!("  f32 cannot carry a global z=32 coordinate (24-bit mantissa loses 8 bits =");
-    println!("  ~1.7 m at the equator, AT P2's threshold). So the wire is a tile id + u16");
+    println!("  f32 cannot carry a global z=32 coordinate: a 24-bit mantissa loses 8 bits =");
+    println!("  256 cells x 9.33 mm = ~2.39 m at the equator, OVER P2's 1.69 m bar. (The cell");
+    println!("  is the world width over 2^32; the 6.59 mm in tms.rs is the ROUND-TRIP error, a");
+    println!("  different quantity — reading it as a cell width understates this as ~1.7 m.)");
+    println!("  So the wire is a tile id + u16");
     println!("  tile-local offsets, z=16 tiles (~372 m at Berlin) — and a chain that leaves");
     println!("  its tile must be SPLIT there. The tiled columns price that; the untiled ones");
     println!("  are what a naive count would have claimed.");
