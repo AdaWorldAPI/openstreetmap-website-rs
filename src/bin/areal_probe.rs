@@ -89,6 +89,7 @@
 use std::collections::HashMap;
 
 use osm_soa_bake::geodesy::{meridional_radius, normal_radius};
+use osm_soa_bake::tms::{self, TileXy};
 use osmpbf::{Element, ElementReader};
 
 /// P2's threshold, in metres: one z=24 cell at its coarse end. Same bar P4 used,
@@ -111,6 +112,25 @@ const MEANINGFUL_RUN: usize = 17;
 
 /// The stricter floor, one Fibonacci step up.
 const LONG_RUN: usize = 21;
+
+/// Zoom of the tile a client's local coordinates are relative to.
+///
+/// **f32 cannot carry a global z=32 coordinate**: a 24-bit mantissa against a
+/// 32-bit coordinate drops 8 bits = 256 cells, and at the equator (9.33 mm per
+/// z=32 cell — the world width over 2^32, NOT the 6.59 mm round-trip error,
+/// which is a different quantity) that is **~2.39 m — OVER P2's 1.69 m bar**,
+/// not merely at it. So the wire
+/// carries a tile id plus a **u16 offset within the tile**, quantized-mesh
+/// style. A u16 offset spans 16 bits, so the tile is z = 32 - 16 = **16**, and
+/// full z=32 precision is preserved exactly.
+///
+/// The consequence this column exists to price: a chain that leaves its tile
+/// must be SPLIT there. A z=16 tile is 40_075_017 / 2^16 = 611.5 m at the
+/// equator, ~372 m at Berlin's latitude — shorter than many ways.
+const TILE_Z: u32 = 16;
+
+/// Bytes one wire point costs: two u16 tile-local offsets.
+const WIRE_POINT_B: u64 = 4;
 
 /// Class bits, for the shared-boundary attribution.
 const C_WATER: u16 = 1 << 0;
@@ -388,6 +408,12 @@ fn gamma_bits(n: u64) -> u32 {
 /// The deviation is the **true distance from each point to the curve**, found by
 /// a coarse scan plus ternary refinement — see the comment at the measurement.
 fn fit_cubic_bezier(pts: &[(f64, f64)]) -> Option<f64> {
+    fit_cubic_bezier_at(pts).map(|(e, _)| e)
+}
+
+/// As [`fit_cubic_bezier`], plus the index of the worst-fitting point — which is
+/// where an adaptive subdivision must split, per Schneider.
+fn fit_cubic_bezier_at(pts: &[(f64, f64)]) -> Option<(f64, usize)> {
     let n = pts.len();
     if n < 4 {
         return None;
@@ -517,11 +543,41 @@ fn fit_cubic_bezier(pts: &[(f64, f64)]) -> Option<f64> {
         }
     }
 
-    Some(
-        pts.iter()
-            .map(|&pt| project(p1, p2, pt).1)
-            .fold(0.0f64, f64::max),
-    )
+    let mut worst = (0.0f64, 0usize);
+    for (i, &pt) in pts.iter().enumerate() {
+        let d = project(p1, p2, pt).1;
+        if d > worst.0 {
+            worst = (d, i);
+        }
+    }
+    Some(worst)
+}
+
+/// Cubic segments needed to carry `pts` within `tol` metres, by adaptive
+/// subdivision at the worst-fitting point.
+///
+/// This is the RENDERING question, which is not the fitting question. A client
+/// does not care whether one cubic could carry the whole way — it cares how many
+/// control points cross the wire and reach the vertex shader. WebGL has no
+/// tessellation stage (that is WebGPU / GL4), so a curve is either expanded on
+/// the CPU or evaluated per-vertex from control points uploaded once; either
+/// way the win is bandwidth and vertex count, never rasterisation.
+fn bezier_segments(pts: &[(f64, f64)], tol: f64) -> usize {
+    // Fewer than 4 points cannot constrain a cubic; such a piece still costs one
+    // segment's worth of control points, so it counts as one rather than zero.
+    if pts.len() < 4 {
+        return 1;
+    }
+    match fit_cubic_bezier_at(pts) {
+        Some((e, _)) if e <= tol => 1,
+        Some((_, i)) => {
+            // Split at the worst point, keeping it in both halves so the pieces
+            // share an endpoint — a path, not a scatter of loose curves.
+            let k = i.clamp(1, pts.len() - 2);
+            bezier_segments(&pts[..=k], tol) + bezier_segments(&pts[k..], tol)
+        }
+        None => 1,
+    }
 }
 
 /// Max deviation, metres, of a **clothoid** — curvature linear in arc length.
@@ -789,6 +845,15 @@ struct Acc {
     /// is never quoted without saying how much of the class it covers.
     fitted: u64,
     fitted_vertices: u64,
+    /// Column 10 — the RENDERING budget: vertices a polyline uploads today
+    /// against control points an equivalent cubic path would upload.
+    poly_vertices: u64,
+    ctrl_points: u64,
+    /// The same two counts once chains are split at z=16 tile boundaries —
+    /// which the wire format forces, because the offsets are tile-local.
+    poly_vertices_tiled: u64,
+    ctrl_points_tiled: u64,
+    tiles_touched: u64,
 }
 
 fn pct(n: u64, d: u64) -> f64 {
@@ -987,6 +1052,41 @@ fn measure(acc: &mut Acc, ids: &[i64], pts: &[(f64, f64)], ll: &[(f64, f64)]) {
         }
         if let Some(c) = fit_circle(pts) {
             acc.err_circle.push(c);
+        }
+        // A joined cubic path of S segments costs 3S+1 control points, because
+        // consecutive segments share an endpoint. Counting 4S would inflate the
+        // Bezier side by a third and flatter the comparison.
+        let segs = bezier_segments(pts, Z24_CELL_M) as u64;
+        acc.poly_vertices += n as u64;
+        acc.ctrl_points += 3 * segs + 1;
+
+        // …and the same two counts once the WIRE FORMAT is honoured. Offsets are
+        // tile-local, so a chain that leaves its tile is split there: each piece
+        // carries its own tile id and repeats the boundary vertex. Splitting is
+        // at the vertex where the tile changes — not at the exact crossing
+        // point, which would need interpolation; that makes this a floor on the
+        // tiled cost, and it is a floor for BOTH forms equally.
+        let tile_of = |c: TileXy| (c.x >> (32 - TILE_Z), c.y_xyz >> (32 - TILE_Z));
+        let mut cuts: Vec<usize> = vec![0];
+        let mut prev = tile_of(tms::point_to_cell(ll[0].1, ll[0].0));
+        let mut distinct = 1u64;
+        for (i, &(la, lo)) in ll.iter().enumerate().skip(1) {
+            let t = tile_of(tms::point_to_cell(lo, la));
+            if t != prev {
+                cuts.push(i);
+                distinct += 1;
+                prev = t;
+            }
+        }
+        cuts.push(n - 1);
+        acc.tiles_touched += distinct;
+        for w in cuts.windows(2) {
+            let piece = &pts[w[0]..=w[1]];
+            if piece.len() < 2 {
+                continue;
+            }
+            acc.poly_vertices_tiled += piece.len() as u64;
+            acc.ctrl_points_tiled += 3 * bezier_segments(piece, Z24_CELL_M) as u64 + 1;
         }
     }
     let mut i = 0usize;
@@ -1516,6 +1616,42 @@ fn main() {
     }
     println!("  \"cover\" = share of the class's vertices living on a chain long enough to fit.");
 
+    println!("\n(x) the RENDERING budget — what crosses the wire, not what fits");
+    println!("  f32 cannot carry a global z=32 coordinate (24-bit mantissa loses 8 bits =");
+    println!("  ~1.7 m at the equator, AT P2's threshold). So the wire is a tile id + u16");
+    println!("  tile-local offsets, z=16 tiles (~372 m at Berlin) — and a chain that leaves");
+    println!("  its tile must be SPLIT there. The tiled columns price that; the untiled ones");
+    println!("  are what a naive count would have claimed.");
+    println!("  a polyline uploads N vertices; a joined cubic path uploads 3S+1 control");
+    println!("  points for S segments subdivided until each clears P2's bar. WebGL has no");
+    println!("  tessellation stage, so the curve is expanded on the CPU or per-vertex from");
+    println!("  control points — the win is bandwidth and vertex count, never rasterisation.");
+    println!(
+        "{:<14} {:>10} {:>10} {:>7} {:>10} {:>10} {:>7} {:>7}",
+        "class", "poly", "ctrl", "ratio", "poly tiled", "ctrl tiled", "ratio", "tiles"
+    );
+    for bit in order {
+        let Some(a) = by_class.get(&bit) else {
+            continue;
+        };
+        if a.poly_vertices == 0 {
+            continue;
+        }
+        println!(
+            "{:<14} {:>10} {:>10} {:>6.2}x {:>10} {:>10} {:>6.2}x {:>7.2}",
+            class_name(bit),
+            a.poly_vertices,
+            a.ctrl_points,
+            a.poly_vertices as f64 / a.ctrl_points as f64,
+            a.poly_vertices_tiled,
+            a.ctrl_points_tiled,
+            a.poly_vertices_tiled as f64 / a.ctrl_points_tiled.max(1) as f64,
+            a.tiles_touched as f64 / a.fitted as f64,
+        );
+    }
+    println!("  ratio > 1 means the curve form uploads LESS. Below 1 it uploads MORE.");
+    println!("  both forms cost {WIRE_POINT_B} B per point (two u16 offsets), so the ratio is bytes too.");
+
     println!("\n(v) shared boundary — P4 measured buildings at 8.58% of edge slots");
     for bit in [C_WATER, C_WOOD, C_GREEN] {
         let Some((slots, sh, partners)) = shared.get(&bit) else {
@@ -1715,6 +1851,75 @@ mod tests {
                 (r * a.cos(), r * a.sin())
             })
             .collect()
+    }
+
+    #[test]
+    fn the_tile_zoom_is_the_one_a_u16_offset_actually_addresses() {
+        // The wire format's arithmetic, pinned. A u16 offset spans 16 bits, so
+        // it can only reach z=32 precision from a z=16 tile — off-by-one here
+        // would silently change both the split count and the precision claim.
+        assert_eq!(
+            32 - TILE_Z,
+            16,
+            "u16 offset must cover exactly the low bits"
+        );
+        assert_eq!(WIRE_POINT_B, 4, "two u16 offsets");
+        // …and the f32 figure the whole tile-local decision rests on: 24-bit
+        // mantissa against a 32-bit coordinate loses 8 bits = 256 cells.
+        let cells_lost = 1u64 << (32 - 24);
+        assert_eq!(cells_lost, 256);
+        // The z=32 cell at the equator is the world width over 2^32 = 9.33 mm.
+        // NOT 6.59 mm: `tms.rs` reports 6.59 mm as the ROUND-TRIP error (exact
+        // lon/lat -> tile -> centre -> lon/lat), which is a different quantity
+        // and about a factor sqrt(2) smaller. Reading it as a cell width puts
+        // the f32 loss at ~1.7 m, i.e. exactly AT P2's bar; the true cell puts
+        // it at ~2.39 m, i.e. OVER the bar. Same conclusion, stronger.
+        let cell_m = 40_075_017.0 / 4_294_967_296.0;
+        assert!(
+            (0.0093..0.0094).contains(&cell_m),
+            "z=32 cell at the equator is 9.33 mm (got {cell_m})"
+        );
+        let metres = cell_m * cells_lost as f64;
+        assert!(
+            metres > Z24_CELL_M,
+            "f32 loss ({metres} m) must EXCEED P2's {Z24_CELL_M} m bar, not merely reach it"
+        );
+        assert!(
+            (2.3..2.5).contains(&metres),
+            "…and it is ~2.39 m (got {metres})"
+        );
+    }
+
+    #[test]
+    fn subdivision_costs_one_segment_on_a_shallow_arc_and_more_on_a_long_one() {
+        // Column 10's mechanism, two-sided. A gentle arc must need ONE cubic; a
+        // full circle must need several, or the subdivision is not adapting and
+        // the ratio column is a constant dressed up as a measurement.
+        let gentle = arc(500.0, 0.3, 40);
+        assert_eq!(bezier_segments(&gentle, Z24_CELL_M), 1);
+
+        let full = arc(50.0, std::f64::consts::TAU, 64);
+        let s = bezier_segments(&full, Z24_CELL_M);
+        assert!(s >= 2, "a closed circle cannot be one cubic (got {s})");
+
+        // …and a tighter bar must cost MORE segments, or the tolerance is inert.
+        let loose = bezier_segments(&arc(50.0, std::f64::consts::PI, 64), 1.69);
+        let tight = bezier_segments(&arc(50.0, std::f64::consts::PI, 64), 0.001);
+        assert!(
+            tight > loose,
+            "tightening the bar must cost segments ({tight} vs {loose})"
+        );
+    }
+
+    #[test]
+    fn a_short_chain_costs_a_segment_rather_than_nothing() {
+        // The trap that would make the ratio column lie in the Bezier's favour:
+        // chains too short to fit are exactly where a curve form WASTES points,
+        // so they must cost one segment, not zero.
+        assert_eq!(
+            bezier_segments(&[(0.0, 0.0), (1.0, 0.0), (2.0, 0.5)], 1.69),
+            1
+        );
     }
 
     #[test]
