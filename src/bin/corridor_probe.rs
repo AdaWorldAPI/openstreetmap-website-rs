@@ -218,16 +218,16 @@ struct Way {
     class: &'static str,
 }
 
+/// A stitched corridor: how many ways went in, its class, and its node run.
+type Corridor = (usize, &'static str, Vec<i64>);
+
 /// Stitch ways into corridors at nodes where exactly two way ENDS meet and
 /// nothing else passes through.
 ///
 /// Returns the corridors as node sequences, plus how many merges were declined
 /// purely because the two ways were of different classes — the measured cost of
 /// the same-class constraint.
-fn build_corridors(
-    ways: &[Way],
-    routable_ref: &HashMap<i64, u32>,
-) -> (Vec<(usize, Vec<i64>)>, u64) {
+fn build_corridors(ways: &[Way], routable_ref: &HashMap<i64, u32>) -> (Vec<Corridor>, u64) {
     // node -> the (way, end) pairs terminating there. `end` is 0 = first, 1 = last.
     let mut ends: HashMap<i64, Vec<(usize, u8)>> = HashMap::new();
     for (i, w) in ways.iter().enumerate() {
@@ -262,58 +262,64 @@ fn build_corridors(
     // Walk maximal chains. Start from any way with a free end; whatever is left
     // afterwards is a cycle and is emitted from an arbitrary member.
     let mut used = vec![false; ways.len()];
-    let mut out: Vec<(usize, Vec<i64>)> = Vec::new();
+    let mut out: Vec<Corridor> = Vec::new();
 
-    let emit = |start: usize, used: &mut Vec<bool>, out: &mut Vec<(usize, Vec<i64>)>| {
-        let mut nodes: Vec<i64> = ways[start].nodes.clone();
-        used[start] = true;
-        let mut count = 1usize;
-        // Extend forward from the tail.
-        let mut cur = start;
-        let mut cur_tail_end = 1u8;
-        while let Some(next) = link[cur][cur_tail_end as usize] {
-            if used[next] {
-                break;
+    // The class travels WITH the corridor, taken from its seed way. The first
+    // version looked it up afterwards by scanning every way for one whose
+    // endpoint matched the corridor's first node — which finds *a* way, not the
+    // right one, and mis-attributed corridors across classes. It surfaced as a
+    // class reporting MORE corridors than ways, which stitching cannot produce.
+    let emit =
+        |start: usize, used: &mut Vec<bool>, out: &mut Vec<(usize, &'static str, Vec<i64>)>| {
+            let mut nodes: Vec<i64> = ways[start].nodes.clone();
+            used[start] = true;
+            let mut count = 1usize;
+            // Extend forward from the tail.
+            let mut cur = start;
+            let mut cur_tail_end = 1u8;
+            while let Some(next) = link[cur][cur_tail_end as usize] {
+                if used[next] {
+                    break;
+                }
+                let join = *nodes.last().unwrap();
+                let mut seg = ways[next].nodes.clone();
+                if seg[0] != join {
+                    seg.reverse();
+                }
+                debug_assert_eq!(seg[0], join, "corridors join at a shared node");
+                nodes.extend_from_slice(&seg[1..]);
+                used[next] = true;
+                count += 1;
+                cur_tail_end = u8::from(ways[next].nodes[0] == join);
+                cur = next;
             }
-            let join = *nodes.last().unwrap();
-            let mut seg = ways[next].nodes.clone();
-            if seg[0] != join {
-                seg.reverse();
+            // Extend backward from the head.
+            let mut cur = start;
+            let mut cur_head_end = 0u8;
+            while let Some(prev) = link[cur][cur_head_end as usize] {
+                if used[prev] {
+                    break;
+                }
+                let join = nodes[0];
+                let mut seg = ways[prev].nodes.clone();
+                if *seg.last().unwrap() != join {
+                    seg.reverse();
+                }
+                debug_assert_eq!(
+                    *seg.last().unwrap(),
+                    join,
+                    "corridors join at a shared node"
+                );
+                let mut merged = seg[..seg.len() - 1].to_vec();
+                merged.extend_from_slice(&nodes);
+                nodes = merged;
+                used[prev] = true;
+                count += 1;
+                cur_head_end = u8::from(*ways[prev].nodes.last().unwrap() == join);
+                cur = prev;
             }
-            debug_assert_eq!(seg[0], join, "corridors join at a shared node");
-            nodes.extend_from_slice(&seg[1..]);
-            used[next] = true;
-            count += 1;
-            cur_tail_end = u8::from(ways[next].nodes[0] == join);
-            cur = next;
-        }
-        // Extend backward from the head.
-        let mut cur = start;
-        let mut cur_head_end = 0u8;
-        while let Some(prev) = link[cur][cur_head_end as usize] {
-            if used[prev] {
-                break;
-            }
-            let join = nodes[0];
-            let mut seg = ways[prev].nodes.clone();
-            if *seg.last().unwrap() != join {
-                seg.reverse();
-            }
-            debug_assert_eq!(
-                *seg.last().unwrap(),
-                join,
-                "corridors join at a shared node"
-            );
-            let mut merged = seg[..seg.len() - 1].to_vec();
-            merged.extend_from_slice(&nodes);
-            nodes = merged;
-            used[prev] = true;
-            count += 1;
-            cur_head_end = u8::from(*ways[prev].nodes.last().unwrap() == join);
-            cur = prev;
-        }
-        out.push((count, nodes));
-    };
+            out.push((count, ways[start].class, nodes));
+        };
 
     for i in 0..ways.len() {
         if used[i] {
@@ -394,9 +400,7 @@ fn main() {
     // Per-class stats, ways vs corridors, measured by the same code.
     let mut way_stats: HashMap<&str, Stat> = HashMap::new();
     let mut cor_stats: HashMap<&str, Stat> = HashMap::new();
-    let mut class_by_first: HashMap<usize, &'static str> = HashMap::new();
-    for (i, w) in ways.iter().enumerate() {
-        class_by_first.insert(i, w.class);
+    for w in &ways {
         let ll: Vec<(f64, f64)> = w
             .nodes
             .iter()
@@ -408,7 +412,7 @@ fn main() {
         let pts: Vec<(f64, f64)> = ll.iter().map(|&(a, o)| frame.xy(a, o)).collect();
         measure(way_stats.entry(w.class).or_default(), &ll, &pts);
     }
-    for (ways_in, nodes) in &corridors {
+    for (ways_in, class, nodes) in &corridors {
         let ll: Vec<(f64, f64)> = nodes
             .iter()
             .filter_map(|n| coords.get(n).copied())
@@ -420,11 +424,7 @@ fn main() {
         // Class of a corridor = the class of its members (they are all equal by
         // construction), read from any one of them.
         let _ = ways_in;
-        let class = ways
-            .iter()
-            .find(|w| w.nodes[0] == nodes[0] || *w.nodes.last().unwrap() == nodes[0])
-            .map_or("other", |w| w.class);
-        measure(cor_stats.entry(class).or_default(), &ll, &pts);
+        measure(cor_stats.entry(*class).or_default(), &ll, &pts);
     }
 
     let order = [
@@ -529,6 +529,44 @@ mod tests {
     }
 
     #[test]
+    fn stitching_can_only_reduce_the_count_and_the_class_travels_with_the_corridor() {
+        // The invariant that exposed a real bug: merging ways cannot produce
+        // MORE corridors than ways. The first version attributed a corridor's
+        // class by scanning every way for one whose endpoint matched the
+        // corridor's first node — which finds *a* way, not the right one — and
+        // a class duly reported more corridors than it had ways.
+        let ways = vec![
+            way(&[1, 2, 3], "classified"),
+            way(&[3, 4, 5], "classified"),
+            way(&[10, 11], "residential"),
+            // Shares node 1 with the classified corridor's HEAD but is a
+            // different way of a different class: what the old lookup grabbed.
+            way(&[1, 20, 21], "residential"),
+        ];
+        let r = refs_of(&ways);
+        let (cor, _) = build_corridors(&ways, &r);
+        assert!(cor.len() <= ways.len(), "stitching never adds corridors");
+
+        let mut per: HashMap<&str, usize> = HashMap::new();
+        for (_, c, _) in &cor {
+            *per.entry(c).or_insert(0) += 1;
+        }
+        let mut ways_per: HashMap<&str, usize> = HashMap::new();
+        for w in &ways {
+            *ways_per.entry(w.class).or_insert(0) += 1;
+        }
+        for (c, n) in &per {
+            assert!(
+                n <= ways_per.get(c).unwrap_or(&0),
+                "class {c}: {n} corridors from {:?} ways",
+                ways_per.get(c)
+            );
+        }
+        assert_eq!(per.get("classified"), Some(&1));
+        assert_eq!(per.get("residential"), Some(&2));
+    }
+
+    #[test]
     fn two_ways_meeting_at_a_free_end_become_one_corridor() {
         // The whole point: an OSM split that is not a junction is merged away.
         let ways = vec![way(&[1, 2, 3], "classified"), way(&[3, 4, 5], "classified")];
@@ -536,7 +574,7 @@ mod tests {
         let (cor, declined) = build_corridors(&ways, &r);
         assert_eq!(cor.len(), 1, "one corridor");
         assert_eq!(
-            cor[0].1,
+            cor[0].2,
             vec![1, 2, 3, 4, 5],
             "joined, shared node not repeated"
         );
@@ -585,7 +623,7 @@ mod tests {
         let r = refs_of(&ways);
         let (cor, _) = build_corridors(&ways, &r);
         assert_eq!(cor.len(), 1);
-        assert_eq!(cor[0].1, vec![1, 2, 3, 4, 5]);
+        assert_eq!(cor[0].2, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -612,6 +650,6 @@ mod tests {
         let r = refs_of(&ways);
         let (cor, _) = build_corridors(&ways, &r);
         assert_eq!(cor.len(), 1);
-        assert_eq!(cor[0].1, vec![1, 2, 3, 4, 1]);
+        assert_eq!(cor[0].2, vec![1, 2, 3, 4, 1]);
     }
 }
