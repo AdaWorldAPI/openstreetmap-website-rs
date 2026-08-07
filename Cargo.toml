@@ -55,3 +55,11 @@ path = "src/bin/slab_stats.rs"
 [[bin]]
 name = "building_probe"
 path = "src/bin/building_probe.rs"
+
+[[bin]]
+name = "wayclass_probe"
+path = "src/bin/wayclass_probe.rs"
+
+[[bin]]
+name = "areal_probe"
+path = "src/bin/areal_probe.rs"
