@@ -485,18 +485,47 @@ fn main() {
     }
 
     // ── Postcode as the disambiguator, and the Berlin objection to it. ──
+    // SECOND ROUND. The first pass learns a component's postcodes only from
+    // addresses that already resolved by name and proximity alone — which keeps
+    // it non-circular, but leaves thinly-covered components with NO postcode at
+    // all. An address then "matches no candidate" for want of information
+    // rather than because of a genuine mismatch, and reporting those together
+    // overstates the failure.
+    //
+    // So: resolve once, feed what that settled back in, resolve again. One
+    // round only — iterating to a fixed point would let a guess become
+    // evidence for the next guess.
+    for (pc, cands) in &ambiguous_cases {
+        let (Some(pc), true) = (pc, cands.len() > 1) else {
+            continue;
+        };
+        let hits: Vec<usize> = cands
+            .iter()
+            .copied()
+            .filter(|c| comp_pc.get(c).is_some_and(|s| s.contains(pc)))
+            .collect();
+        if hits.len() == 1 {
+            comp_pc.entry(hits[0]).or_default().insert(pc.clone());
+        }
+    }
+
     let (mut pc_unique, mut pc_still_several, mut pc_none_matched, mut pc_missing) =
         (0u64, 0u64, 0u64, 0u64);
+    let mut pc_no_data = 0u64;
     for (pc, cands) in &ambiguous_cases {
         let Some(pc) = pc else {
             pc_missing += 1;
             continue;
         };
+        let known = cands.iter().filter(|c| comp_pc.contains_key(*c)).count();
         let hits = cands
             .iter()
             .filter(|c| comp_pc.get(*c).is_some_and(|s| s.contains(pc)))
             .count();
         match hits {
+            // No candidate has ANY postcode on record: the pair could not be
+            // applied, which is not the same as the pair failing.
+            0 if known == 0 => pc_no_data += 1,
             0 => pc_none_matched += 1,
             1 => pc_unique += 1,
             _ => pc_still_several += 1,
@@ -520,8 +549,12 @@ fn main() {
         pct(pc_still_several, ambiguous)
     );
     println!(
-        "    postcode matched NO candidate   {pc_none_matched:>9}  ({:.1}%)",
+        "    postcode matched NO candidate   {pc_none_matched:>9}  ({:.1}%)  <- genuine mismatch",
         pct(pc_none_matched, ambiguous)
+    );
+    println!(
+        "    no candidate HAS a postcode     {pc_no_data:>9}  ({:.1}%)  <- missing data, not a failure",
+        pct(pc_no_data, ambiguous)
     );
     println!(
         "    address carried no postcode     {pc_missing:>9}  ({:.1}%)",

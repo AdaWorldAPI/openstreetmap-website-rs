@@ -47,6 +47,7 @@
 
 use std::collections::HashMap;
 
+use osm_soa_bake::curve::point_in_ring;
 use osm_soa_bake::geodesy::{meridional_radius, normal_radius};
 use osmpbf::{Element, ElementReader};
 
@@ -71,6 +72,58 @@ const MONOTONE_TOL: f64 = 0.9;
 
 /// Share of one side that must share a parity before the split counts.
 const PARITY_TOL: f64 = 0.9;
+
+/// A closed areal ring: what it is, its points, and its bbox.
+type Ring = (&'static str, Vec<(f64, f64)>, (f64, f64), (f64, f64));
+
+/// One street segment in the metre frame.
+type Seg = ((f64, f64), (f64, f64));
+
+/// How far off the street centreline to probe what occupies the sparse side.
+///
+/// Far enough to clear the carriageway and the verge, near enough to still be
+/// the parcel fronting this street rather than the next block.
+const PROBE_OFFSET_M: f64 = 25.0;
+
+/// What a sparse side turns out to hold. A one-sided street is only a finding
+/// once this says WHY.
+fn areal_kind(tags: &[(&str, &str)]) -> Option<&'static str> {
+    let get = |k: &str| tags.iter().find(|(t, _)| *t == k).map(|(_, v)| *v);
+    if let Some(l) = get("landuse") {
+        return match l {
+            "industrial" | "commercial" | "retail" | "port" | "quarry" => Some("industry"),
+            "forest" | "forestry" => Some("wood"),
+            "meadow" | "grass" | "village_green" | "farmland" | "orchard" | "allotments"
+            | "cemetery" | "recreation_ground" => Some("green"),
+            "railway" => Some("railway"),
+            "reservoir" | "basin" => Some("water"),
+            _ => None,
+        };
+    }
+    if let Some(n) = get("natural") {
+        return match n {
+            "wood" | "scrub" => Some("wood"),
+            "water" | "wetland" => Some("water"),
+            "heath" | "grassland" | "sand" | "beach" => Some("green"),
+            _ => None,
+        };
+    }
+    if let Some(l) = get("leisure") {
+        return match l {
+            "park" | "garden" | "nature_reserve" | "pitch" | "sports_centre" | "golf_course" => {
+                Some("green")
+            }
+            _ => None,
+        };
+    }
+    if get("railway").is_some() || get("aeroway").is_some() {
+        return Some("railway");
+    }
+    if get("man_made") == Some("works") || get("amenity") == Some("school") {
+        return Some("industry");
+    }
+    None
+}
 
 struct Frame {
     lat0: f64,
@@ -260,6 +313,8 @@ fn main() {
     let mut street_names: Vec<String> = Vec::new();
     let mut street_nodes: Vec<Vec<i64>> = Vec::new();
     let mut addrs: Vec<((f64, f64), String, String)> = Vec::new();
+    // Closed areal rings, for explaining a sparse side.
+    let mut rings: Vec<Ring> = Vec::new();
     ElementReader::from_path(path)
         .expect("open")
         .for_each(|el| {
@@ -274,6 +329,24 @@ fn main() {
                 if let Some(n) = get("name") {
                     street_names.push(n.to_string());
                     street_nodes.push(ids.clone());
+                }
+            }
+            if let Some(kind) = areal_kind(&tags) {
+                if ids.len() >= 4 && ids.first() == ids.last() {
+                    let pts: Vec<(f64, f64)> = ids
+                        .iter()
+                        .filter_map(|i| coords.get(i).copied())
+                        .map(|(la, lo)| frame.xy(la, lo))
+                        .collect();
+                    if pts.len() == ids.len() {
+                        let mut lo = (f64::MAX, f64::MAX);
+                        let mut hi = (f64::MIN, f64::MIN);
+                        for &(x, y) in &pts {
+                            lo = (lo.0.min(x), lo.1.min(y));
+                            hi = (hi.0.max(x), hi.1.max(y));
+                        }
+                        rings.push((kind, pts, lo, hi));
+                    }
                 }
             }
             if let (Some(num), Some(st)) = (get("addr:housenumber"), get("addr:street")) {
@@ -350,6 +423,34 @@ fn main() {
         }
     }
 
+    // Ring index, and the street segments of each component — the probe point
+    // is offset from the CENTRELINE, not derived from the addresses, or it
+    // would only ever find what is already next to a house.
+    let mut ring_grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (ri, (_, _, lo, hi)) in rings.iter().enumerate() {
+        let cx0 = (lo.0 / CELL_M).floor() as i32;
+        let cx1 = (hi.0 / CELL_M).floor() as i32;
+        let cy0 = (lo.1 / CELL_M).floor() as i32;
+        let cy1 = (hi.1 / CELL_M).floor() as i32;
+        for cx in cx0..=cx1 {
+            for cy in cy0..=cy1 {
+                ring_grid.entry((cx, cy)).or_default().push(ri);
+            }
+        }
+    }
+    let mut comp_segs: HashMap<usize, Vec<Seg>> = HashMap::new();
+    for (wi, nodes) in street_nodes.iter().enumerate() {
+        for si in 0..nodes.len().saturating_sub(1) {
+            let (Some(&a), Some(&b)) = (coords.get(&nodes[si]), coords.get(&nodes[si + 1])) else {
+                continue;
+            };
+            comp_segs
+                .entry(comp_of[wi])
+                .or_default()
+                .push((frame.xy(a.0, a.1), frame.xy(b.0, b.1)));
+        }
+    }
+
     // Assign each address to (component, side) with its decimal number.
     // (position, side, decimal number) for one address.
     type Placed = ((f64, f64), i8, f64);
@@ -404,7 +505,8 @@ fn main() {
     let mut half_irregular = 0u64;
     let mut sparse_side_size: HashMap<usize, u64> = HashMap::new();
     let (mut parity_split, mut parity_checked) = (0u64, 0u64);
-    for members in per_comp.values() {
+    let mut explain: Vec<(usize, i8)> = Vec::new();
+    for (&comp, members) in &per_comp {
         if members.len() < MIN_SIDE * 2 {
             too_few += 1;
             continue;
@@ -481,10 +583,12 @@ fn main() {
             (Side::Up | Side::Down, Side::TooFew) => {
                 one_sided += 1;
                 *sparse_side_size.entry(nr).or_insert(0) += 1;
+                explain.push((comp, -1i8));
             }
             (Side::TooFew, Side::Up | Side::Down) => {
                 one_sided += 1;
                 *sparse_side_size.entry(nl).or_insert(0) += 1;
+                explain.push((comp, 1i8));
             }
             // Ordered on one side and genuinely SCRAMBLED on the other. This is
             // the partial failure the previous version conflated with the above.
@@ -560,7 +664,65 @@ fn main() {
     println!("  (a street with an industrial complex on one side has ONE numbered side;");
     println!("   counting that as a failure was an error in the first version of this probe.)");
 
-    println!("\n(3) parity — odd one side, even the other");
+    // ── Why is the sparse side sparse? ──
+    let mut why: HashMap<&'static str, u64> = HashMap::new();
+    let mut explained = 0u64;
+    for (comp, sparse_sign) in &explain {
+        let Some(segs) = comp_segs.get(comp) else {
+            *why.entry("(no street geometry)").or_insert(0) += 1;
+            continue;
+        };
+        let mut hits: HashMap<&'static str, u64> = HashMap::new();
+        for (a, b) in segs.iter().take(40) {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let l = (dx * dx + dy * dy).sqrt();
+            if l <= 0.0 {
+                continue;
+            }
+            // Unit normal, flipped to the sparse side. The side convention is
+            // the same cross product the addresses were classified with, so
+            // "sparse" here means the same thing it meant there.
+            let n = (
+                -dy / l * f64::from(*sparse_sign),
+                dx / l * f64::from(*sparse_sign),
+            );
+            let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+            let p = (mid.0 + n.0 * PROBE_OFFSET_M, mid.1 + n.1 * PROBE_OFFSET_M);
+            let key = ((p.0 / CELL_M).floor() as i32, (p.1 / CELL_M).floor() as i32);
+            let Some(cands) = ring_grid.get(&key) else {
+                continue;
+            };
+            for &ri in cands {
+                let (kind, ring, lo, hi) = &rings[ri];
+                if p.0 < lo.0 || p.0 > hi.0 || p.1 < lo.1 || p.1 > hi.1 {
+                    continue;
+                }
+                if point_in_ring(p, ring) {
+                    *hits.entry(kind).or_insert(0) += 1;
+                }
+            }
+        }
+        if let Some((k, _)) = hits.iter().max_by_key(|(_, v)| **v) {
+            *why.entry(k).or_insert(0) += 1;
+            explained += 1;
+        } else {
+            *why.entry("nothing mapped there").or_insert(0) += 1;
+        }
+    }
+    println!(
+        "\n(3) WHY is the sparse side sparse? — probing {PROBE_OFFSET_M:.0} m off the centreline"
+    );
+    let mut ws: Vec<(&&str, &u64)> = why.iter().collect();
+    ws.sort_by(|a, b| b.1.cmp(a.1));
+    for (k, v) in ws {
+        println!("  {k:<22} {v:>7}  ({:.1}%)", pct(*v, one_sided));
+    }
+    println!(
+        "  explained by something mapped: {explained} of {one_sided}  ({:.1}%)",
+        pct(explained, one_sided)
+    );
+
+    println!("\n(4) parity — odd one side, even the other");
     println!(
         "  clean split {parity_split:>8} of {parity_checked} checked  ({:.1}%)",
         pct(parity_split, parity_checked)

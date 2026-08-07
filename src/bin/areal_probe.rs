@@ -89,7 +89,8 @@
 use std::collections::HashMap;
 
 use osm_soa_bake::curve::{
-    bezier_segments, fit_circle, fit_clothoid, fit_cubic_bezier, varint_len, wrap_pi, zigzag,
+    bezier_segments, fit_circle, fit_clothoid, fit_cubic_bezier, point_in_ring, varint_len,
+    wrap_pi, zigzag,
 };
 use osm_soa_bake::geodesy::{meridional_radius, normal_radius};
 use osm_soa_bake::tms::{self, TileXy};
@@ -292,25 +293,6 @@ fn foot_access(tags: &[(&str, &str)]) -> Foot {
         };
     }
     Foot::Silent
-}
-
-/// Is `p` strictly inside the closed ring `ring`? Crossing-number ray cast.
-///
-/// The half-open rule on the y comparison (`>` on one end, `<=` on the other) is
-/// what makes a vertex exactly at the ray's height count once rather than twice
-/// — without it a point level with a vertex flips to the wrong answer.
-fn point_in_ring(p: (f64, f64), ring: &[(f64, f64)]) -> bool {
-    let mut inside = false;
-    for w in ring.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        if (a.1 > p.1) != (b.1 > p.1) {
-            let t = (p.1 - a.1) / (b.1 - a.1);
-            if p.0 < a.0 + t * (b.0 - a.0) {
-                inside = !inside;
-            }
-        }
-    }
-    inside
 }
 
 /// A closed areal ring held back for column 6.
