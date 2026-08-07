@@ -171,6 +171,9 @@ struct Addr {
     at: (f64, f64),
     street: Option<String>,
     number: String,
+    /// The proposed disambiguator: (street, postcode) where street alone is not
+    /// unique. Measured rather than assumed to work.
+    postcode: Option<String>,
     /// Which of the three encodings carried it.
     form: &'static str,
 }
@@ -186,7 +189,8 @@ fn main() {
     // ── Pass 1: coordinates, frame anchor, and address NODES. ──
     let mut coords: HashMap<i64, (f64, f64)> = HashMap::with_capacity(8_000_000);
     let (mut slat, mut slon) = (0.0f64, 0.0f64);
-    let mut node_addrs: Vec<(i64, Option<String>, String)> = Vec::new();
+    type NodeAddr = (i64, Option<String>, String, Option<String>);
+    let mut node_addrs: Vec<NodeAddr> = Vec::new();
     ElementReader::from_path(path)
         .expect("open")
         .for_each(|el| {
@@ -204,6 +208,7 @@ fn main() {
                     id,
                     get("addr:street").map(std::string::ToString::to_string),
                     num.to_string(),
+                    get("addr:postcode").map(std::string::ToString::to_string),
                 ));
             }
         })
@@ -216,6 +221,8 @@ fn main() {
     let mut street_nodes: Vec<Vec<i64>> = Vec::new();
     let mut addrs: Vec<Addr> = Vec::new();
     let mut interpolation = 0u64;
+    let mut postal_boundaries = 0u64;
+
     let mut distinct_numbers: HashSet<String> = HashSet::new();
     let mut distinct_streets: HashSet<String> = HashSet::new();
 
@@ -239,6 +246,10 @@ fn main() {
             if get("addr:interpolation").is_some() {
                 interpolation += 1;
             }
+            if get("boundary") == Some("postal_code") {
+                postal_boundaries += 1;
+            }
+            let _ = &postal_boundaries;
             if let Some(num) = get("addr:housenumber") {
                 // Centroid of the way, which is what a consumer would place.
                 let pts: Vec<(f64, f64)> =
@@ -257,6 +268,7 @@ fn main() {
                     at: (sx / k, sy / k),
                     street: get("addr:street").map(std::string::ToString::to_string),
                     number: num.to_string(),
+                    postcode: get("addr:postcode").map(std::string::ToString::to_string),
                     form: if get("building").is_some() {
                         "building way"
                     } else {
@@ -267,12 +279,13 @@ fn main() {
         })
         .expect("pass 2");
 
-    for (id, street, number) in node_addrs {
+    for (id, street, number, postcode) in node_addrs {
         if let Some(&(la, lo)) = coords.get(&id) {
             addrs.push(Addr {
                 at: frame.xy(la, lo),
                 street,
                 number,
+                postcode,
                 form: "node",
             });
         }
@@ -350,6 +363,12 @@ fn main() {
     let (mut no_street_tag, mut name_absent, mut resolved_one, mut ambiguous, mut too_far) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut ambiguous_tight = 0u64;
+    // Postcode columns. `comp_pc` is built from the UNAMBIGUOUS addresses only,
+    // so it is not circular: a component's postcodes come from houses that
+    // already resolved to it by name and proximity alone.
+    let mut comp_pc: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut ambiguous_cases: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+    let mut with_postcode = 0u64;
     let mut worst = (0usize, String::new());
     for a in &addrs {
         let Some(name) = &a.street else {
@@ -395,10 +414,20 @@ fn main() {
             too_far += 1;
             continue;
         }
+        if a.postcode.is_some() {
+            with_postcode += 1;
+        }
         if near.len() == 1 {
             resolved_one += 1;
+            if let Some(pc) = &a.postcode {
+                comp_pc
+                    .entry(*near.iter().next().unwrap())
+                    .or_default()
+                    .insert(pc.clone());
+            }
         } else {
             ambiguous += 1;
+            ambiguous_cases.push((a.postcode.clone(), near.iter().copied().collect()));
             if near.len() > worst.0 {
                 worst = (near.len(), name.clone());
             }
@@ -455,7 +484,60 @@ fn main() {
         );
     }
 
-    println!("\n(3) house numbers are not numbers");
+    // ── Postcode as the disambiguator, and the Berlin objection to it. ──
+    let (mut pc_unique, mut pc_still_several, mut pc_none_matched, mut pc_missing) =
+        (0u64, 0u64, 0u64, 0u64);
+    for (pc, cands) in &ambiguous_cases {
+        let Some(pc) = pc else {
+            pc_missing += 1;
+            continue;
+        };
+        let hits = cands
+            .iter()
+            .filter(|c| comp_pc.get(*c).is_some_and(|s| s.contains(pc)))
+            .count();
+        match hits {
+            0 => pc_none_matched += 1,
+            1 => pc_unique += 1,
+            _ => pc_still_several += 1,
+        }
+    }
+    let multi_pc = comp_pc.values().filter(|s| s.len() > 1).count() as u64;
+    let widest = comp_pc.values().map(HashSet::len).max().unwrap_or(0);
+
+    println!("\n(3) does (street, POSTCODE) settle what the name alone could not?");
+    println!(
+        "  addresses carrying addr:postcode  {with_postcode:>9}  ({:.1}%)",
+        pct(with_postcode, total)
+    );
+    println!("  of the {ambiguous} ambiguous cases:");
+    println!(
+        "    resolved to exactly ONE         {pc_unique:>9}  ({:.1}%)",
+        pct(pc_unique, ambiguous)
+    );
+    println!(
+        "    still several candidates        {pc_still_several:>9}  ({:.1}%)",
+        pct(pc_still_several, ambiguous)
+    );
+    println!(
+        "    postcode matched NO candidate   {pc_none_matched:>9}  ({:.1}%)",
+        pct(pc_none_matched, ambiguous)
+    );
+    println!(
+        "    address carried no postcode     {pc_missing:>9}  ({:.1}%)",
+        pct(pc_missing, ambiguous)
+    );
+
+    println!("\n(4) …but a street can SPAN postcodes, so it is not a street property");
+    println!(
+        "  components whose addresses carry >1 postcode: {multi_pc} of {} ({:.1}%)",
+        comp_pc.len(),
+        pct(multi_pc, comp_pc.len() as u64)
+    );
+    println!("  widest: one connected street carrying {widest} distinct postcodes");
+    println!("  where that happens, (name, postcode) names a STRETCH, not the street.");
+
+    println!("\n(5) house numbers are not numbers");
     let mut kinds: HashMap<NumKind, u64> = HashMap::new();
     for a in &addrs {
         *kinds.entry(classify_number(&a.number)).or_insert(0) += 1;
@@ -466,7 +548,7 @@ fn main() {
         println!("  {k:<10?} {c:>9}  ({:.1}%)", pct(*c, total));
     }
 
-    println!("\n(4) codebook pressure — the u24 ceiling is 16,777,215");
+    println!("\n(6) codebook pressure — the u24 ceiling is 16,777,215");
     println!("  distinct house numbers {:>9}", distinct_numbers.len());
     println!("  distinct street names   {:>9}", distinct_streets.len());
 }
