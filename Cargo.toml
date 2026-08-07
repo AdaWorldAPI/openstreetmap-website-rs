@@ -71,3 +71,7 @@ path = "src/bin/graph_probe.rs"
 [[bin]]
 name = "corridor_probe"
 path = "src/bin/corridor_probe.rs"
+
+[[bin]]
+name = "addr_probe"
+path = "src/bin/addr_probe.rs"
