@@ -113,19 +113,23 @@ const MEANINGFUL_RUN: usize = 17;
 const LONG_RUN: usize = 21;
 
 /// Class bits, for the shared-boundary attribution.
-const C_WATER: u8 = 1 << 0;
-const C_WOOD: u8 = 1 << 1;
-const C_GREEN: u8 = 1 << 2;
-const C_BUILDING: u8 = 1 << 3;
-const C_LINEAR_WATER: u8 = 1 << 4;
-const C_OTHER: u8 = 1 << 5;
+const C_WATER: u16 = 1 << 0;
+const C_WOOD: u16 = 1 << 1;
+const C_GREEN: u16 = 1 << 2;
+const C_BUILDING: u16 = 1 << 3;
+const C_LINEAR_WATER: u16 = 1 << 4;
+const C_OTHER: u16 = 1 << 5;
 /// The classified network — the roads laid out to a design standard (RAL/RAS-L),
 /// whose alignment is by construction straight / clothoid / circular arc.
-const C_ROAD: u8 = 1 << 6;
+const C_ROAD: u16 = 1 << 6;
 /// Residential and unclassified — the CONTROL inside the road family. If a
 /// design standard is what makes a chain ride a template, these should ride it
 /// less well than the classified network above.
-const C_RESID: u8 = 1 << 7;
+const C_RESID: u16 = 1 << 7;
+/// `junction=roundabout` — the circular class, and it is TAGGED rather than
+/// guessed. This is the one place a rational Bezier could pay for itself, so it
+/// gets measured on its own instead of being averaged into the road rows.
+const C_ROUNDABOUT: u16 = 1 << 8;
 
 /// A local equirectangular frame — metres from an anchor.
 struct Frame {
@@ -155,7 +159,7 @@ impl Frame {
 }
 
 /// Which class a way's tags put it in, or `None` if it is not of interest.
-fn classify(tags: &[(&str, &str)]) -> Option<(u8, &'static str)> {
+fn classify(tags: &[(&str, &str)]) -> Option<(u16, &'static str)> {
     let get = |k: &str| tags.iter().find(|(t, _)| *t == k).map(|(_, v)| *v);
 
     if tags
@@ -198,6 +202,9 @@ fn classify(tags: &[(&str, &str)]) -> Option<(u8, &'static str)> {
         };
     }
     if let Some(h) = get("highway") {
+        if get("junction") == Some("roundabout") {
+            return Some((C_ROUNDABOUT, "junction=roundabout"));
+        }
         return match h {
             "motorway" | "trunk" | "primary" | "secondary" | "tertiary" | "motorway_link"
             | "trunk_link" | "primary_link" | "secondary_link" | "tertiary_link" => {
@@ -306,7 +313,7 @@ struct Access {
     denied_walked: u64,
 }
 
-fn class_name(bit: u8) -> &'static str {
+fn class_name(bit: u16) -> &'static str {
     match bit {
         C_WATER => "water",
         C_WOOD => "wood",
@@ -314,6 +321,7 @@ fn class_name(bit: u8) -> &'static str {
         C_BUILDING => "building",
         C_LINEAR_WATER => "linear water",
         C_ROAD => "road (DIN)",
+        C_ROUNDABOUT => "roundabout",
         C_RESID => "residential",
         _ => "other",
     }
@@ -368,6 +376,305 @@ fn fib_bits(n: u64) -> u32 {
 fn gamma_bits(n: u64) -> u32 {
     debug_assert!(n >= 1);
     2 * n.ilog2() + 1
+}
+
+/// Max deviation, metres, of a **single cubic Bézier** fitted through `pts`.
+///
+/// Schneider's classic fit: endpoints are pinned, tangents come from the data,
+/// and the two interior control points are the least-squares solution along
+/// those tangents under chord-length parametrisation. No reparametrisation
+/// iteration — one shot, which is what a bake would afford.
+///
+/// The deviation is the **true distance from each point to the curve**, found by
+/// a coarse scan plus ternary refinement — see the comment at the measurement.
+fn fit_cubic_bezier(pts: &[(f64, f64)]) -> Option<f64> {
+    let n = pts.len();
+    if n < 4 {
+        return None;
+    }
+    let p0 = pts[0];
+    let p3 = pts[n - 1];
+    let unit = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l = (dx * dx + dy * dy).sqrt();
+        if l <= 0.0 {
+            None
+        } else {
+            Some((dx / l, dy / l))
+        }
+    };
+    // End tangents by the SECOND-ORDER one-sided difference, not the first
+    // chord. A chord is off by half the sampling step (0.7 deg on a 64-sample
+    // quarter circle) and over a ~0.55r control arm that alone lands the
+    // control point ~5e-3*r away. `-3p0 + 4p1 - p2` is O(h^2) instead of O(h).
+    let dir = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+        let v = (4.0 * b.0 - c.0 - 3.0 * a.0, 4.0 * b.1 - c.1 - 3.0 * a.1);
+        let l = (v.0 * v.0 + v.1 * v.1).sqrt();
+        if l <= 0.0 {
+            None
+        } else {
+            Some((v.0 / l, v.1 / l))
+        }
+    };
+    let t1 = dir(pts[0], pts[1], pts[2]).or_else(|| unit(pts[0], pts[1]))?;
+    let t2 = dir(pts[n - 1], pts[n - 2], pts[n - 3]).or_else(|| unit(pts[n - 1], pts[n - 2]))?;
+
+    // Initial parametrisation: chord length.
+    let mut u = Vec::with_capacity(n);
+    let mut acc = 0.0;
+    u.push(0.0);
+    for w in pts.windows(2) {
+        acc += ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+        u.push(acc);
+    }
+    if acc <= 0.0 {
+        return None;
+    }
+    for v in &mut u {
+        *v /= acc;
+    }
+
+    let eval = |p1: (f64, f64), p2: (f64, f64), t: f64| {
+        let m = 1.0 - t;
+        (
+            p0.0 * m * m * m + 3.0 * p1.0 * t * m * m + 3.0 * p2.0 * t * t * m + p3.0 * t * t * t,
+            p0.1 * m * m * m + 3.0 * p1.1 * t * m * m + 3.0 * p2.1 * t * t * m + p3.1 * t * t * t,
+        )
+    };
+    // Closest point on the curve: coarse scan, then ternary refine. Used BOTH
+    // for the final error and to reparametrise between refits — a fixed
+    // chord-length parametrisation is not the best-fitting one, which is why
+    // Schneider's algorithm iterates here and why a single pass sat ~15x above
+    // the published quarter-circle figure.
+    let project = |p1: (f64, f64), p2: (f64, f64), pt: (f64, f64)| {
+        const SCAN: usize = 64;
+        let d2 = |t: f64| {
+            let (bx, by) = eval(p1, p2, t);
+            (pt.0 - bx).powi(2) + (pt.1 - by).powi(2)
+        };
+        let (mut best, mut bd) = (0usize, f64::MAX);
+        for k in 0..=SCAN {
+            let d = d2(k as f64 / SCAN as f64);
+            if d < bd {
+                bd = d;
+                best = k;
+            }
+        }
+        let (mut lo, mut hi) = (
+            best.saturating_sub(1) as f64 / SCAN as f64,
+            (best + 1).min(SCAN) as f64 / SCAN as f64,
+        );
+        for _ in 0..60 {
+            let m1 = lo + (hi - lo) / 3.0;
+            let m2 = hi - (hi - lo) / 3.0;
+            if d2(m1) < d2(m2) {
+                hi = m2;
+            } else {
+                lo = m1;
+            }
+        }
+        let t = (lo + hi) / 2.0;
+        (t, d2(t).sqrt())
+    };
+
+    let mut p1 = p0;
+    let mut p2 = p3;
+    for pass in 0..6 {
+        // Least squares for the two tangent magnitudes (Graphics Gems normal eqs).
+        let (mut c00, mut c01, mut c11, mut x0, mut x1) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (i, &pt) in pts.iter().enumerate() {
+            let t = u[i];
+            let m = 1.0 - t;
+            let (b0, b1, b2, b3) = (m * m * m, 3.0 * t * m * m, 3.0 * t * t * m, t * t * t);
+            let a0 = (t1.0 * b1, t1.1 * b1);
+            let a1 = (t2.0 * b2, t2.1 * b2);
+            c00 += a0.0 * a0.0 + a0.1 * a0.1;
+            c01 += a0.0 * a1.0 + a0.1 * a1.1;
+            c11 += a1.0 * a1.0 + a1.1 * a1.1;
+            let tmp = (
+                pt.0 - (p0.0 * (b0 + b1) + p3.0 * (b2 + b3)),
+                pt.1 - (p0.1 * (b0 + b1) + p3.1 * (b2 + b3)),
+            );
+            x0 += a0.0 * tmp.0 + a0.1 * tmp.1;
+            x1 += a1.0 * tmp.0 + a1.1 * tmp.1;
+        }
+        let det = c00 * c11 - c01 * c01;
+        let (a, b) = if det.abs() > 1e-12 {
+            ((x0 * c11 - x1 * c01) / det, (c00 * x1 - c01 * x0) / det)
+        } else {
+            // Degenerate normal equations: fall back to the standard
+            // third-of-chord heuristic rather than fabricating a zero error.
+            let d = ((p3.0 - p0.0).powi(2) + (p3.1 - p0.1).powi(2)).sqrt() / 3.0;
+            (d, d)
+        };
+        p1 = (p0.0 + t1.0 * a, p0.1 + t1.1 * a);
+        p2 = (p3.0 + t2.0 * b, p3.1 + t2.1 * b);
+        if pass == 5 {
+            break;
+        }
+        for (i, &pt) in pts.iter().enumerate() {
+            u[i] = project(p1, p2, pt).0;
+        }
+    }
+
+    Some(
+        pts.iter()
+            .map(|&pt| project(p1, p2, pt).1)
+            .fold(0.0f64, f64::max),
+    )
+}
+
+/// Max deviation, metres, of a **clothoid** — curvature linear in arc length.
+///
+/// This is the storage form the shape hypothesis implies: `theta(s) = theta0 +
+/// k0*s + k1*s^2/2`, so a segment is three numbers (`k0`, `k1`, `L`) and no
+/// control points at all. Fitted by least squares on heading against arc length,
+/// then integrated back to positions and compared with the real ones — the fit
+/// is in heading, the verdict is in metres, because metres are what P2 bounds.
+fn fit_clothoid(pts: &[(f64, f64)]) -> Option<f64> {
+    let n = pts.len();
+    if n < 4 {
+        return None;
+    }
+    let mut seg = Vec::with_capacity(n - 1);
+    let mut head = Vec::with_capacity(n - 1);
+    for w in pts.windows(2) {
+        let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+        let l = (dx * dx + dy * dy).sqrt();
+        if l <= 0.0 {
+            return None;
+        }
+        seg.push(l);
+        head.push(dy.atan2(dx));
+    }
+    // Unwrap the heading so the regression sees a continuous function.
+    for i in 1..head.len() {
+        let d = wrap_pi(head[i] - head[i - 1]);
+        head[i] = head[i - 1] + d;
+    }
+    // Midpoint arc length of each segment.
+    let mut mid = Vec::with_capacity(seg.len());
+    let mut acc = 0.0;
+    for &l in &seg {
+        mid.push(acc + l / 2.0);
+        acc += l;
+    }
+    // Least squares theta = a + b*s + c*s^2 (normal equations, 3x3).
+    let m = mid.len() as f64;
+    let (mut s1, mut s2, mut s3, mut s4) = (0.0, 0.0, 0.0, 0.0);
+    let (mut ty, mut tsy, mut ts2y) = (0.0, 0.0, 0.0);
+    for (i, &sv) in mid.iter().enumerate() {
+        let (v2, v3, v4) = (sv * sv, sv * sv * sv, sv * sv * sv * sv);
+        s1 += sv;
+        s2 += v2;
+        s3 += v3;
+        s4 += v4;
+        ty += head[i];
+        tsy += sv * head[i];
+        ts2y += v2 * head[i];
+    }
+    let a = [[m, s1, s2], [s1, s2, s3], [s2, s3, s4]];
+    let rhs = [ty, tsy, ts2y];
+    let sol = solve3(a, rhs)?;
+    let (t0, k0, half_k1) = (sol[0], sol[1], sol[2]);
+
+    // Integrate the fitted heading back to positions, using the REAL segment
+    // lengths: the claim under test is the shape, not the sampling.
+    let (mut x, mut y) = pts[0];
+    let mut worst: f64 = 0.0;
+    let mut acc = 0.0;
+    for (i, &l) in seg.iter().enumerate() {
+        let sm = acc + l / 2.0;
+        let th = t0 + k0 * sm + half_k1 * sm * sm;
+        x += l * th.cos();
+        y += l * th.sin();
+        acc += l;
+        let (tx, tyy) = pts[i + 1];
+        worst = worst.max(((x - tx).powi(2) + (y - tyy).powi(2)).sqrt());
+    }
+    Some(worst)
+}
+
+/// Max radial deviation, metres, of an algebraic (Kasa) **circle** fit.
+///
+/// Only meaningful where the shape really is a conic — which is why it is
+/// reported for `junction=roundabout` rather than for everything.
+fn fit_circle(pts: &[(f64, f64)]) -> Option<f64> {
+    let n = pts.len();
+    if n < 4 {
+        return None;
+    }
+    let (mut sx, mut sy) = (0.0, 0.0);
+    for &(x, y) in pts {
+        sx += x;
+        sy += y;
+    }
+    let (cx0, cy0) = (sx / n as f64, sy / n as f64);
+    let (mut suu, mut suv, mut svv, mut suuu, mut svvv, mut suvv, mut svuu) =
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(x, y) in pts {
+        let (u, v) = (x - cx0, y - cy0);
+        suu += u * u;
+        suv += u * v;
+        svv += v * v;
+        suuu += u * u * u;
+        svvv += v * v * v;
+        suvv += u * v * v;
+        svuu += v * u * u;
+    }
+    let det = suu * svv - suv * suv;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let b1 = 0.5 * (suuu + suvv);
+    let b2 = 0.5 * (svvv + svuu);
+    let uc = (b1 * svv - b2 * suv) / det;
+    let vc = (suu * b2 - suv * b1) / det;
+    let (cx, cy) = (cx0 + uc, cy0 + vc);
+    let r = pts
+        .iter()
+        .map(|&(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt())
+        .sum::<f64>()
+        / n as f64;
+    Some(
+        pts.iter()
+            .map(|&(x, y)| (((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - r).abs())
+            .fold(0.0f64, f64::max),
+    )
+}
+
+/// Gaussian elimination with partial pivoting on a 3x3.
+fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
+    for i in 0..3 {
+        let mut piv = i;
+        for r in i + 1..3 {
+            if a[r][i].abs() > a[piv][i].abs() {
+                piv = r;
+            }
+        }
+        if a[piv][i].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(i, piv);
+        b.swap(i, piv);
+        for r in i + 1..3 {
+            let f = a[r][i] / a[i][i];
+            let row = a[i];
+            for (c, v) in a[r].iter_mut().enumerate().skip(i) {
+                *v -= f * row[c];
+            }
+            b[r] -= f * b[i];
+        }
+    }
+    let mut x = [0.0f64; 3];
+    for i in (0..3).rev() {
+        let mut v = b[i];
+        for c in i + 1..3 {
+            v -= a[i][c] * x[c];
+        }
+        x[i] = v / a[i][i];
+    }
+    Some(x)
 }
 
 /// Order-0 Shannon entropy of a histogram, in bits per symbol.
@@ -474,6 +781,14 @@ struct Acc {
     /// Chain lengths, so "no run reached 17" can be told apart from "no chain
     /// was even 17 long" — two very different verdicts.
     chain_len: Vec<u64>,
+    /// Column 9 — fit error, metres, for chains long enough to fit (>= 4 pts).
+    err_bezier: Vec<f64>,
+    err_clothoid: Vec<f64>,
+    err_circle: Vec<f64>,
+    /// Chains offered to the fits, and vertices they speak for — so a pass rate
+    /// is never quoted without saying how much of the class it covers.
+    fitted: u64,
+    fitted_vertices: u64,
 }
 
 fn pct(n: u64, d: u64) -> f64 {
@@ -661,6 +976,19 @@ fn measure(acc: &mut Acc, ids: &[i64], pts: &[(f64, f64)], ll: &[(f64, f64)]) {
     // define a stride trivially and would score every chain alike.
     acc.run_vertices += qd.len() as u64;
     acc.chain_len.push(qd.len() as u64);
+
+    // ── Column 9: which curve family carries this chain, at P2's bar. ──
+    if let Some(e) = fit_cubic_bezier(pts) {
+        acc.fitted += 1;
+        acc.fitted_vertices += n as u64;
+        acc.err_bezier.push(e);
+        if let Some(c) = fit_clothoid(pts) {
+            acc.err_clothoid.push(c);
+        }
+        if let Some(c) = fit_circle(pts) {
+            acc.err_circle.push(c);
+        }
+    }
     let mut i = 0usize;
     while i < qd.len() {
         let mut j = i + 1;
@@ -763,11 +1091,11 @@ fn main() {
 
     // ── Pass 2: ways. ──
     let mut by_tag: HashMap<&'static str, Acc> = HashMap::new();
-    let mut by_class: HashMap<u8, Acc> = HashMap::new();
+    let mut by_class: HashMap<u16, Acc> = HashMap::new();
     // Undirected edge → the class bits of every way that uses it.
-    let mut edge_use: HashMap<(i64, i64), u8> = HashMap::with_capacity(6_000_000);
+    let mut edge_use: HashMap<(i64, i64), u16> = HashMap::with_capacity(6_000_000);
     // Per areal way: its class and its edges, so column 5 can attribute after.
-    let mut areal_edges: Vec<(u8, Vec<(i64, i64)>)> = Vec::with_capacity(100_000);
+    let mut areal_edges: Vec<(u16, Vec<(i64, i64)>)> = Vec::with_capacity(100_000);
     let mut clipped = 0u64;
     // Column 6: every pedestrian node, and every closed wood/green ring.
     let mut foot_pts: Vec<(f64, f64)> = Vec::with_capacity(1_200_000);
@@ -871,7 +1199,7 @@ fn main() {
         .expect("pass 3");
 
     // ── Column 5: shared boundary. ──
-    let mut shared: HashMap<u8, (u64, u64, HashMap<u8, u64>)> = HashMap::new();
+    let mut shared: HashMap<u16, (u64, u64, HashMap<u16, u64>)> = HashMap::new();
     for (bit, edges) in &areal_edges {
         let entry = shared.entry(*bit).or_insert((0, 0, HashMap::new()));
         for e in edges {
@@ -1009,6 +1337,7 @@ fn main() {
     let order = [
         C_BUILDING,
         C_ROAD,
+        C_ROUNDABOUT,
         C_RESID,
         C_WATER,
         C_WOOD,
@@ -1147,6 +1476,46 @@ fn main() {
         );
     }
 
+    println!("\n(ix) which curve family carries the chain, at P2's bar (1 z=24 cell)");
+    println!("  cubic Bezier is the EVALUATION form; the clothoid (k0, k1, L) is the storage");
+    println!("  form the shape hypothesis implies. Circle is reported only where the class is");
+    println!("  genuinely conic — junction=roundabout is TAGGED, so it is read, not guessed.");
+    println!("  bezier error = TRUE distance to the curve (scan + ternary refine). Measuring");
+    println!("  it at the point's own parameter inflates it ~27x and was this probe's first");
+    println!("  version. clothoid error is a RECONSTRUCTION distance at matched arc length,");
+    println!("  so it is the stricter number: it carries the chain's accumulated drift too.");
+    println!(
+        "{:<16} {:>8} {:>7} {:>9} {:>9} {:>10} {:>10} {:>9}",
+        "class", "chains", "cover", "bez p50", "bez p95", "bez<1.69", "cloth p95", "circ p95"
+    );
+    for bit in order {
+        let Some(a) = by_class.get(&bit) else {
+            continue;
+        };
+        if a.fitted == 0 {
+            continue;
+        }
+        let mut b = a.err_bezier.clone();
+        b.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let mut c = a.err_clothoid.clone();
+        c.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let mut r = a.err_circle.clone();
+        r.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let pass = b.iter().filter(|&&e| e < Z24_CELL_M).count() as u64;
+        println!(
+            "{:<16} {:>8} {:>6.1}% {:>8.3}m {:>8.3}m {:>9.1}% {:>9.3}m {:>8.3}m",
+            class_name(bit),
+            a.fitted,
+            pct(a.fitted_vertices, a.nodes),
+            q(&b, 0.5),
+            q(&b, 0.95),
+            pct(pass, a.fitted),
+            q(&c, 0.95),
+            q(&r, 0.95),
+        );
+    }
+    println!("  \"cover\" = share of the class's vertices living on a chain long enough to fit.");
+
     println!("\n(v) shared boundary — P4 measured buildings at 8.58% of edge slots");
     for bit in [C_WATER, C_WOOD, C_GREEN] {
         let Some((slots, sh, partners)) = shared.get(&bit) else {
@@ -1159,7 +1528,7 @@ fn main() {
             sh,
             pct_f(*sh as f64, *slots as f64)
         );
-        let mut ps: Vec<(&u8, &u64)> = partners.iter().collect();
+        let mut ps: Vec<(&u16, &u64)> = partners.iter().collect();
         ps.sort_by(|a, b| b.1.cmp(a.1));
         for (p, c) in ps.iter().take(5) {
             println!("      with {:<14} {:>9}", class_name(**p), c);
@@ -1336,6 +1705,102 @@ mod tests {
             d < 5.0,
             "…but 0.5 deg steps must not wander metres off (got {d})"
         );
+    }
+
+    /// A circular arc of radius `r` spanning `sweep` radians, `n` samples.
+    fn arc(r: f64, sweep: f64, n: usize) -> Vec<(f64, f64)> {
+        (0..=n)
+            .map(|i| {
+                let a = sweep * i as f64 / n as f64;
+                (r * a.cos(), r * a.sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_cubic_hits_the_published_quarter_circle_error() {
+        // The strongest falsifier available: a single cubic Bezier approximating
+        // a 90 deg arc is known to sit at ~2.7e-4 of the radius. Pinning against
+        // a PUBLISHED constant checks the fit against the literature rather than
+        // against itself — a fit that silently returned its own residual would
+        // pass a self-consistency test and fail this one.
+        for r in [10.0, 100.0, 1000.0] {
+            let e = fit_cubic_bezier(&arc(r, std::f64::consts::FRAC_PI_2, 64)).unwrap();
+            assert!(
+                e < 3.5e-4 * r,
+                "quarter circle r={r}: {e} exceeds the ~2.7e-4*r figure"
+            );
+            assert!(e > 0.0, "…but a cubic is NOT exact on a circle");
+        }
+    }
+
+    #[test]
+    fn a_full_circle_defeats_one_cubic_and_the_circle_fit_nails_it() {
+        // Why the roundabout row reads the way it does, two-sided. A closed
+        // conic cannot be one cubic at any degree — the standard construction
+        // needs four. So that row argues for RECOGNISING the conic, not
+        // necessarily for a rational Bezier, and the test says both halves.
+        let full = arc(50.0, std::f64::consts::TAU, 64);
+        let bez = fit_cubic_bezier(&full).unwrap();
+        let cir = fit_circle(&full).unwrap();
+        assert!(bez > 10.0, "one cubic cannot close a circle (got {bez})");
+        assert!(
+            cir < 1e-6,
+            "the circle fit is exact on a circle (got {cir})"
+        );
+    }
+
+    #[test]
+    fn the_clothoid_form_absorbs_the_circle_because_k1_is_zero() {
+        // The reason the kappa storage form does not need a separate conic case:
+        // a circle is the degenerate clothoid (curvature constant, k1 = 0). If
+        // this failed, roundabouts really would need their own curve family.
+        let e = fit_clothoid(&arc(50.0, std::f64::consts::TAU, 64)).unwrap();
+        assert!(e < 0.05, "a circle is a clothoid with k1=0 (got {e})");
+    }
+
+    #[test]
+    fn the_clothoid_beats_the_circle_where_curvature_actually_varies() {
+        // Two-sided against the test above: on a REAL clothoid (curvature linear
+        // in arc length) the circle fit must be materially worse, or the two
+        // forms are not distinguishable and column 9 measures nothing.
+        let (k0, k1, l, n) = (0.0f64, 0.002f64, 200.0f64, 200usize);
+        let mut pts = vec![(0.0, 0.0)];
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        let ds = l / n as f64;
+        for i in 0..n {
+            let sm = (i as f64 + 0.5) * ds;
+            let th = k0 * sm + 0.5 * k1 * sm * sm;
+            x += ds * th.cos();
+            y += ds * th.sin();
+            pts.push((x, y));
+        }
+        let cl = fit_clothoid(&pts).unwrap();
+        let ci = fit_circle(&pts).unwrap();
+        assert!(
+            cl < 0.01,
+            "the clothoid fit reproduces a clothoid (got {cl})"
+        );
+        assert!(
+            ci > 20.0 * cl.max(1e-9),
+            "a circle must NOT explain a varying curvature (circle {ci}, clothoid {cl})"
+        );
+    }
+
+    #[test]
+    fn every_fit_is_near_exact_on_a_straight_line_and_refuses_short_chains() {
+        // A straight line is the common degenerate case in this corpus (86.7% of
+        // road vertices turn less than 5 deg), so a fit that blew up on it would
+        // poison the road rows. And all three must REFUSE a chain too short to
+        // constrain them rather than returning a flattering zero.
+        let line: Vec<(f64, f64)> = (0..=20).map(|i| (i as f64 * 5.0, 0.0)).collect();
+        assert!(fit_cubic_bezier(&line).unwrap() < 1e-9);
+        assert!(fit_clothoid(&line).unwrap() < 1e-9);
+
+        let short = vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)];
+        assert!(fit_cubic_bezier(&short).is_none());
+        assert!(fit_clothoid(&short).is_none());
+        assert!(fit_circle(&short).is_none());
     }
 
     #[test]
