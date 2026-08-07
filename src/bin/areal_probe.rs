@@ -101,6 +101,17 @@ const NEAR_DEG: f64 = 5.0;
 /// Heading quantum for the angle-delta chain, degrees.
 const ANGLE_QUANTUM_DEG: f64 = 0.5;
 
+/// The shortest run that can mean anything on a stride-4-over-17 curve ruler.
+///
+/// `gcd(4, 17) = 1`, so the walk is a full permutation of all 17 residues — but
+/// only after **17** steps. A run shorter than that has not visited the ruler;
+/// calling it "on the template" is reading structure into noise. Runs of 3 are
+/// reported alongside purely to show what that naive floor would have claimed.
+const MEANINGFUL_RUN: usize = 17;
+
+/// The stricter floor, one Fibonacci step up.
+const LONG_RUN: usize = 21;
+
 /// Class bits, for the shared-boundary attribution.
 const C_WATER: u8 = 1 << 0;
 const C_WOOD: u8 = 1 << 1;
@@ -108,6 +119,13 @@ const C_GREEN: u8 = 1 << 2;
 const C_BUILDING: u8 = 1 << 3;
 const C_LINEAR_WATER: u8 = 1 << 4;
 const C_OTHER: u8 = 1 << 5;
+/// The classified network — the roads laid out to a design standard (RAL/RAS-L),
+/// whose alignment is by construction straight / clothoid / circular arc.
+const C_ROAD: u8 = 1 << 6;
+/// Residential and unclassified — the CONTROL inside the road family. If a
+/// design standard is what makes a chain ride a template, these should ride it
+/// less well than the classified network above.
+const C_RESID: u8 = 1 << 7;
 
 /// A local equirectangular frame — metres from an anchor.
 struct Frame {
@@ -177,6 +195,18 @@ fn classify(tags: &[(&str, &str)]) -> Option<(u8, &'static str)> {
             }
             "forestry" => Some((C_WOOD, "landuse=forestry")),
             _ => Some((C_OTHER, "landuse (other)")),
+        };
+    }
+    if let Some(h) = get("highway") {
+        return match h {
+            "motorway" | "trunk" | "primary" | "secondary" | "tertiary" | "motorway_link"
+            | "trunk_link" | "primary_link" | "secondary_link" | "tertiary_link" => {
+                Some((C_ROAD, "highway (classified)"))
+            }
+            "residential" | "unclassified" | "living_street" => {
+                Some((C_RESID, "highway (residential)"))
+            }
+            _ => None,
         };
     }
     if let Some(l) = get("leisure") {
@@ -283,6 +313,8 @@ fn class_name(bit: u8) -> &'static str {
         C_GREEN => "green",
         C_BUILDING => "building",
         C_LINEAR_WATER => "linear water",
+        C_ROAD => "road (DIN)",
+        C_RESID => "residential",
         _ => "other",
     }
 }
@@ -301,6 +333,78 @@ fn varint_len(v: u64) -> usize {
 /// Zig-zag, so a signed delta costs by magnitude rather than by sign.
 fn zigzag(v: i64) -> u64 {
     ((v << 1) ^ (v >> 63)) as u64
+}
+
+/// Bits a **Fibonacci (Zeckendorf) codeword** for `n >= 1` occupies.
+///
+/// Every positive integer is a unique sum of non-consecutive Fibonacci numbers,
+/// so the bit pattern never contains `11` until the appended terminator — which
+/// is what makes the code self-delimiting without a length prefix. Using
+/// `F(2)=1, F(3)=2, F(4)=3, …`, the codeword for `n` is `m` bits where `m` is the
+/// largest index with `F(m) <= n`.
+///
+/// Growth is `~1.44·log2(n)` bits against LEB128's `~1.14·log2(n)` **rounded up
+/// to whole bytes**. Fibonacci therefore wins only while the byte rounding
+/// dominates — small values — and loses once it does not. Which regime the real
+/// data is in is the measurement, not an assumption.
+fn fib_bits(n: u64) -> u32 {
+    debug_assert!(n >= 1);
+    let (mut a, mut b) = (1u64, 2u64); // F(2), F(3)
+    let mut m = 2u32;
+    while b <= n {
+        let next = a + b;
+        a = b;
+        b = next;
+        m += 1;
+    }
+    m
+}
+
+/// Bits an **Elias gamma** codeword for `n >= 1` occupies: `2·floor(log2 n) + 1`.
+///
+/// Present as a control. Without a second bit-level code, "Fibonacci lost" and
+/// "bit-level coding lost" are indistinguishable, and only one of those is a
+/// finding about Fibonacci.
+fn gamma_bits(n: u64) -> u32 {
+    debug_assert!(n >= 1);
+    2 * n.ilog2() + 1
+}
+
+/// Order-0 Shannon entropy of a histogram, in bits per symbol.
+///
+/// The floor any prefix code over these symbols can reach without modelling
+/// context. Reported so a gap between the best code and the floor is visible as
+/// headroom rather than mistaken for optimality.
+fn entropy_bits(hist: &HashMap<u64, u64>) -> f64 {
+    let total: u64 = hist.values().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let t = total as f64;
+    -hist
+        .values()
+        .map(|&c| {
+            let p = c as f64 / t;
+            p * p.log2()
+        })
+        .sum::<f64>()
+}
+
+/// Total bits a histogram costs under each code, plus its entropy floor.
+fn code_costs(hist: &HashMap<u64, u64>) -> (u64, u64, u64, f64, u64) {
+    let mut leb = 0u64;
+    let mut fib = 0u64;
+    let mut gam = 0u64;
+    let mut n = 0u64;
+    for (&v, &c) in hist {
+        // Both bit codes need `n >= 1`; the streams contain 0, so shift.
+        let s = v + 1;
+        leb += 8 * varint_len(v) as u64 * c;
+        fib += u64::from(fib_bits(s)) * c;
+        gam += u64::from(gamma_bits(s)) * c;
+        n += c;
+    }
+    (leb, fib, gam, entropy_bits(hist) * n as f64, n)
 }
 
 /// Wrap to `(-π, π]`.
@@ -348,6 +452,28 @@ struct Acc {
     /// Without this the byte column reads as though §2(c) were cheapest for
     /// every class, when for a curve it is cheap the way an empty box is light.
     turnbit_drift: Vec<f64>,
+    /// Column 7's value streams, as histograms rather than lists — the entropy
+    /// floor needs the distribution and nothing needs the order.
+    hist_len: HashMap<u64, u64>,
+    hist_d1: HashMap<u64, u64>,
+    hist_d2: HashMap<u64, u64>,
+    /// Column 8 — the curve-ruler premise: vertices covered by a maximal run of
+    /// CONSTANT quantised turn (a straight or a circular arc), strict and +/-1
+    /// quantum, and by a run of constant SECOND difference (a clothoid).
+    run_vertices: u64,
+    /// Coverage by runs at each floor. 3 is BELOW the meaningful floor and is
+    /// kept only to show what a naive threshold would have claimed.
+    run_cov3_strict: u64,
+    run_cov17_strict: u64,
+    run_cov21_strict: u64,
+    run_cov17_tol: u64,
+    run_cov17_clothoid: u64,
+    runs_strict: u64,
+    /// Longest constant-turn run seen in the class, in vertices.
+    run_max: u64,
+    /// Chain lengths, so "no run reached 17" can be told apart from "no chain
+    /// was even 17 long" — two very different verdicts.
+    chain_len: Vec<u64>,
 }
 
 fn pct(n: u64, d: u64) -> f64 {
@@ -507,6 +633,82 @@ fn measure(acc: &mut Acc, ids: &[i64], pts: &[(f64, f64)], ll: &[(f64, f64)]) {
     }
     acc.b_angle += b;
 
+    // ── Column 7's streams. ──
+    //
+    // The SECOND difference is the interesting one and it is free: encoding
+    // `q[i] - q[i-1]` instead of `q[i]` reconstructs the same quantised
+    // headings, so the drift measured above is unchanged — only the coding
+    // differs. A smooth boundary changes its curvature slowly, so the second
+    // difference should concentrate near zero where a bit-level code is cheap.
+    for l in &len {
+        *acc.hist_len.entry((l * 100.0).round() as u64).or_insert(0) += 1;
+    }
+    for &k in &qd {
+        *acc.hist_d1.entry(zigzag(k)).or_insert(0) += 1;
+    }
+    for w in qd.windows(2) {
+        *acc.hist_d2.entry(zigzag(w[1] - w[0])).or_insert(0) += 1;
+    }
+
+    // ── Column 8: does this chain ride a template? ──
+    //
+    // helix's Curve-Ruler Principle says a curve is fixed by its endpoints ON a
+    // template — so the question is not "how few bits per vertex" but "do the
+    // vertices lie on a regenerable arc at all". A run of CONSTANT quantised
+    // turn is exactly a straight (0) or a circular arc (k), and a run of
+    // constant SECOND difference is a clothoid — which is what a road designed
+    // to RAL/RAS-L is built from. Runs of >= 3 are counted because two vertices
+    // define a stride trivially and would score every chain alike.
+    acc.run_vertices += qd.len() as u64;
+    acc.chain_len.push(qd.len() as u64);
+    let mut i = 0usize;
+    while i < qd.len() {
+        let mut j = i + 1;
+        while j < qd.len() && qd[j] == qd[i] {
+            j += 1;
+        }
+        let n = j - i;
+        acc.runs_strict += 1;
+        acc.run_max = acc.run_max.max(n as u64);
+        if n >= 3 {
+            acc.run_cov3_strict += n as u64;
+        }
+        if n >= MEANINGFUL_RUN {
+            acc.run_cov17_strict += n as u64;
+        }
+        if n >= LONG_RUN {
+            acc.run_cov21_strict += n as u64;
+        }
+        i = j;
+    }
+    let mut i = 0usize;
+    while i < qd.len() {
+        let mut j = i + 1;
+        while j < qd.len() && (qd[j] - qd[i]).abs() <= 1 {
+            j += 1;
+        }
+        let n = j - i;
+        if n >= MEANINGFUL_RUN {
+            acc.run_cov17_tol += n as u64;
+        }
+        i = j;
+    }
+    if qd.len() >= 2 {
+        let dd: Vec<i64> = qd.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut i = 0usize;
+        while i < dd.len() {
+            let mut j = i + 1;
+            while j < dd.len() && dd[j] == dd[i] {
+                j += 1;
+            }
+            let n = j - i;
+            if n >= MEANINGFUL_RUN {
+                acc.run_cov17_clothoid += n as u64;
+            }
+            i = j;
+        }
+    }
+
     // …and what that costs in position. A heading chain integrates its own
     // quantisation error, so the deviation GROWS along the way — the reason
     // this column reports drift next to bytes instead of bytes alone.
@@ -579,6 +781,10 @@ fn main() {
             if tags.is_empty() {
                 return;
             }
+            // Pedestrian nodes feed column 6 and are collected for EVERY foot
+            // highway; the way itself then falls through to `classify`, which
+            // keeps the designed road classes and drops the rest. An early
+            // return here is what made the road arm dead code on the first run.
             if let Some(hw) = tags.iter().find(|(k, _)| *k == "highway").map(|(_, v)| *v) {
                 if FOOT_HIGHWAY.contains(&hw) {
                     for id in w.refs() {
@@ -587,7 +793,6 @@ fn main() {
                         }
                     }
                 }
-                return;
             }
             let Some((bit, label)) = classify(&tags) else {
                 return;
@@ -801,7 +1006,15 @@ fn main() {
         "{:<16} {:>10} {:>12} {:>12} {:>10} {:>10}",
         "class", "vertices", "straight<5", "square+-5", "median", "p95"
     );
-    let order = [C_BUILDING, C_WATER, C_WOOD, C_GREEN, C_LINEAR_WATER];
+    let order = [
+        C_BUILDING,
+        C_ROAD,
+        C_RESID,
+        C_WATER,
+        C_WOOD,
+        C_GREEN,
+        C_LINEAR_WATER,
+    ];
     for bit in order {
         let Some(a) = by_class.get(&bit) else {
             continue;
@@ -861,6 +1074,76 @@ fn main() {
             q(&tb, 0.95),
             mb(a.b_angle),
             q(&d, 0.95)
+        );
+    }
+
+    println!("\n(vii) bit-level codes on the real value streams — bits per symbol");
+    println!("  LEB128 is byte-granular: a value of 3 costs a full 8 bits. Fibonacci");
+    println!("  (Zeckendorf) and Elias gamma are bit-granular. gamma is the CONTROL, so");
+    println!("  \"Fibonacci lost\" cannot be confused with \"bit-level coding lost\".");
+    println!("  entropy = the order-0 floor; a gap to it is headroom, not optimality.");
+    println!(
+        "{:<14} {:<10} {:>10} {:>8} {:>8} {:>8} {:>9}",
+        "class", "stream", "symbols", "leb128", "fib", "gamma", "entropy"
+    );
+    for bit in order {
+        let Some(a) = by_class.get(&bit) else {
+            continue;
+        };
+        for (name, hist) in [
+            ("length", &a.hist_len),
+            ("d1 head", &a.hist_d1),
+            ("d2 head", &a.hist_d2),
+        ] {
+            let (leb, fib, gam, ent, n) = code_costs(hist);
+            if n == 0 {
+                continue;
+            }
+            let per = |v: u64| v as f64 / n as f64;
+            println!(
+                "{:<14} {:<10} {:>10} {:>8.2} {:>8.2} {:>8.2} {:>9.2}",
+                class_name(bit),
+                name,
+                n,
+                per(leb),
+                per(fib),
+                per(gam),
+                ent / n as f64
+            );
+        }
+    }
+
+    println!("\n(viii) does the chain ride a template? — helix's curve-ruler premise");
+    println!("  a run of CONSTANT quantised turn is a straight or a circular arc; a run of");
+    println!("  constant SECOND difference is a clothoid. The stride-4-over-17 walk only");
+    println!("  completes its permutation after 17 steps, so >=17 is the floor at which a");
+    println!("  run can mean anything; >=3 is printed only to show what a naive floor claims.");
+    println!("  \"max\" and \"med len\" separate \"no run reached 17\" from \"no CHAIN did\".");
+    println!(
+        "{:<16} {:>9} {:>8} {:>8} {:>8} {:>8} {:>9} {:>7} {:>8}",
+        "class", "vertices", ">=3", ">=17", ">=21", "+-1 17", "cloth 17", "max", "med len"
+    );
+    for bit in order {
+        let Some(a) = by_class.get(&bit) else {
+            continue;
+        };
+        if a.run_vertices == 0 {
+            continue;
+        }
+        let mut cl = a.chain_len.clone();
+        cl.sort_unstable();
+        let med = cl[cl.len() / 2];
+        println!(
+            "{:<16} {:>9} {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>8.1}% {:>7} {:>8}",
+            class_name(bit),
+            a.run_vertices,
+            pct(a.run_cov3_strict, a.run_vertices),
+            pct(a.run_cov17_strict, a.run_vertices),
+            pct(a.run_cov21_strict, a.run_vertices),
+            pct(a.run_cov17_tol, a.run_vertices),
+            pct(a.run_cov17_clothoid, a.run_vertices),
+            a.run_max,
+            med,
         );
     }
 
@@ -1056,6 +1339,86 @@ mod tests {
     }
 
     #[test]
+    fn fibonacci_codeword_lengths_match_the_known_short_ones() {
+        // Pinned against hand-derivable values, because a fencepost here would
+        // shift every number in column 7 by a constant and still look plausible.
+        // F(2)=1, F(3)=2, F(4)=3, F(5)=5, F(6)=8, F(7)=13.
+        assert_eq!(fib_bits(1), 2, "1 -> 11");
+        assert_eq!(fib_bits(2), 3, "2 -> 011");
+        assert_eq!(fib_bits(3), 4, "3 -> 0011");
+        assert_eq!(fib_bits(4), 4, "4 = 3+1 -> 1011");
+        assert_eq!(fib_bits(7), 5, "7 = 5+2 -> 01011");
+        assert_eq!(fib_bits(12), 6, "12 = 8+3+1 -> 100011");
+        assert_eq!(fib_bits(13), 7, "13 = F(7) opens a new position");
+        // Monotone and never shorter than 2 bits.
+        for n in 1..2000u64 {
+            assert!(fib_bits(n) >= 2);
+            assert!(fib_bits(n) <= fib_bits(n + 1));
+        }
+    }
+
+    #[test]
+    fn the_bit_codes_beat_leb128_only_on_small_values_and_lose_on_large() {
+        // The whole premise of column 7, two-sided. If Fibonacci were uniformly
+        // better the column would be a foregone conclusion; if uniformly worse
+        // it would be pointless. It is neither, and the crossover is why the
+        // real distribution has to be measured rather than assumed.
+        let small = fib_bits(3);
+        assert!(small < 8, "3 costs {small} bits vs LEB128's 8");
+        let large = fib_bits(2000);
+        assert!(
+            large > 8 * varint_len(2000) as u32,
+            "2000 costs {large} bits vs LEB128's {}",
+            8 * varint_len(2000)
+        );
+        assert!(gamma_bits(3) < 8, "the control agrees on small values");
+    }
+
+    #[test]
+    fn entropy_is_zero_for_one_symbol_and_one_bit_for_a_fair_coin() {
+        // Guards the floor column: a bug making entropy always 0 would report
+        // every code as infinitely wasteful, and one making it constant would
+        // hide real headroom.
+        let mut one = HashMap::new();
+        one.insert(7u64, 100u64);
+        assert!(entropy_bits(&one).abs() < 1e-12, "no surprise, no bits");
+
+        let mut coin = HashMap::new();
+        coin.insert(0u64, 50u64);
+        coin.insert(1u64, 50u64);
+        assert!((entropy_bits(&coin) - 1.0).abs() < 1e-12, "one fair bit");
+
+        assert!(entropy_bits(&HashMap::new()).abs() < 1e-12, "empty is zero");
+    }
+
+    #[test]
+    fn the_second_difference_of_a_smooth_ring_concentrates_at_zero() {
+        // The mechanism column 7 is built to test: a constant-curvature ring
+        // turns by the SAME amount every step, so its second difference is
+        // zero everywhere — the regime where a bit-level code is cheapest.
+        // The first difference is NOT zero, which is what makes the pair
+        // informative rather than a tautology.
+        let (ids, pts) = ngon(120);
+        let ll = vec![(0.0, 0.0); pts.len()];
+        let mut a = Acc::default();
+        measure(&mut a, &ids, &pts, &ll);
+
+        let d2_total: u64 = a.hist_d2.values().sum();
+        let d2_zero = a.hist_d2.get(&0).copied().unwrap_or(0);
+        assert!(
+            d2_zero * 10 >= d2_total * 9,
+            "at least 90% of second differences must be zero (got {d2_zero}/{d2_total})"
+        );
+
+        let d1_total: u64 = a.hist_d1.values().sum();
+        let d1_zero = a.hist_d1.get(&0).copied().unwrap_or(0);
+        assert!(
+            d1_zero * 2 < d1_total,
+            "the FIRST difference must not be mostly zero, or this proves nothing"
+        );
+    }
+
+    #[test]
     fn the_turn_bit_is_exact_on_a_square_and_hopeless_on_a_ring() {
         // Column 4's honesty claim, two-sided. A turn BIT can only say left or
         // right, so it reproduces a footprint exactly and cannot reproduce a
@@ -1139,6 +1502,21 @@ mod tests {
             c(&[("building", "yes"), ("landuse", "forest")]),
             Some(C_BUILDING)
         );
-        assert_eq!(c(&[("highway", "residential")]), None);
+        // Roads joined the probe when the DIN claim came up, so this arm now
+        // discriminates three ways rather than dropping every highway: the
+        // classified network (designed to RAL/RAS-L), the residential control,
+        // and everything else — which stays dropped so column 8's road rows are
+        // not diluted by driveways and footpaths.
+        assert_eq!(c(&[("highway", "secondary")]), Some(C_ROAD));
+        assert_eq!(c(&[("highway", "primary_link")]), Some(C_ROAD));
+        assert_eq!(c(&[("highway", "residential")]), Some(C_RESID));
+        assert_eq!(c(&[("highway", "footway")]), None);
+        assert_eq!(c(&[("highway", "service")]), None);
+        // A building that also carries a highway tag is still a building: it is
+        // the class P4 measured, and column 2 compares against P4's number.
+        assert_eq!(
+            c(&[("building", "yes"), ("highway", "secondary")]),
+            Some(C_BUILDING)
+        );
     }
 }
