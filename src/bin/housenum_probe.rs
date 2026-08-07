@@ -396,6 +396,13 @@ fn main() {
     // Classify each component.
     let (mut parallel, mut horseshoe, mut one_sided, mut irregular, mut too_few, mut no_axis) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    // A street with an industrial complex, a park or a railway on one side has
+    // ONE numbered side and a near-empty other. That is a one-sided template,
+    // not a failure — the first version's match arm folded it in with "the
+    // other side is scrambled", which are opposite verdicts. Split, and the
+    // sparse side's size is reported so the reader can see which case it is.
+    let mut half_irregular = 0u64;
+    let mut sparse_side_size: HashMap<usize, u64> = HashMap::new();
     let (mut parity_split, mut parity_checked) = (0u64, 0u64);
     for members in per_comp.values() {
         if members.len() < MIN_SIDE * 2 {
@@ -465,15 +472,32 @@ fn main() {
             }
         }
 
+        let (nl, nr) = (left.len(), right.len());
         match (side_verdict(left), side_verdict(right)) {
             (Side::Up, Side::Up) | (Side::Down, Side::Down) => parallel += 1,
             (Side::Up, Side::Down) | (Side::Down, Side::Up) => horseshoe += 1,
-            (Side::Up | Side::Down, _) | (_, Side::Up | Side::Down) => one_sided += 1,
+            // Ordered on one side, too few to judge on the other: the
+            // industrial-complex case. A template with one side.
+            (Side::Up | Side::Down, Side::TooFew) => {
+                one_sided += 1;
+                *sparse_side_size.entry(nr).or_insert(0) += 1;
+            }
+            (Side::TooFew, Side::Up | Side::Down) => {
+                one_sided += 1;
+                *sparse_side_size.entry(nl).or_insert(0) += 1;
+            }
+            // Ordered on one side and genuinely SCRAMBLED on the other. This is
+            // the partial failure the previous version conflated with the above.
+            (Side::Up | Side::Down, Side::Irregular) | (Side::Irregular, Side::Up | Side::Down) => {
+                half_irregular += 1;
+            }
+            (Side::TooFew, Side::TooFew) => too_few += 1,
             _ => irregular += 1,
         }
     }
 
-    let total_comp = parallel + horseshoe + one_sided + irregular + too_few + no_axis;
+    let total_comp =
+        parallel + horseshoe + one_sided + half_irregular + irregular + too_few + no_axis;
     println!("\n(1) the decimal encoding — does an obscure number get a position?");
     println!(
         "  representable as a decimal {decimal_ok:>9}  ({:.2}%)",
@@ -495,8 +519,12 @@ fn main() {
         pct(horseshoe, total_comp)
     );
     println!(
-        "  one side only ordered                  {one_sided:>8}  ({:.1}%)",
+        "  one-sided template (other side sparse) {one_sided:>8}  ({:.1}%)",
         pct(one_sided, total_comp)
+    );
+    println!(
+        "  half irregular (other side SCRAMBLED)  {half_irregular:>8}  ({:.1}%)",
+        pct(half_irregular, total_comp)
     );
     println!(
         "  irregular                              {irregular:>8}  ({:.1}%)",
@@ -511,14 +539,26 @@ fn main() {
         pct(no_axis, total_comp)
     );
     println!("  total components with addresses        {total_comp:>8}");
+    let mut ss: Vec<(&usize, &u64)> = sparse_side_size.iter().collect();
+    ss.sort_by_key(|(k, _)| **k);
+    let sparse_desc: String = ss
+        .iter()
+        .take(3)
+        .map(|(k, v)| format!("{k} addr: {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("    the sparse side holds — {sparse_desc}");
+    let judgeable = parallel + horseshoe + one_sided + half_irregular + irregular;
     println!(
-        "\n  TEMPLATE-SHAPED (parallel + horseshoe): {:.1}% of all, {:.1}% of those judgeable",
-        pct(parallel + horseshoe, total_comp),
-        pct(
-            parallel + horseshoe,
-            parallel + horseshoe + one_sided + irregular
-        )
+        "\n  TEMPLATE-SHAPED, two-sided only  {:.1}% of judgeable",
+        pct(parallel + horseshoe, judgeable)
     );
+    println!(
+        "  TEMPLATE-SHAPED incl. one-sided  {:.1}% of judgeable  <- the honest figure",
+        pct(parallel + horseshoe + one_sided, judgeable)
+    );
+    println!("  (a street with an industrial complex on one side has ONE numbered side;");
+    println!("   counting that as a failure was an error in the first version of this probe.)");
 
     println!("\n(3) parity — odd one side, even the other");
     println!(
@@ -530,6 +570,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sparse_other_side_is_a_one_sided_template_not_a_failure() {
+        // The industrial-complex case, and the defect it exposed. A street with
+        // one numbered side and a factory, park or railway opposite has an
+        // ORDERED side and a near-empty one. The first version of the classifier
+        // put that in the same bucket as "the other side is scrambled", which is
+        // the opposite verdict, and under-stated the template share.
+        //
+        // Here the distinction is made at the level the classifier uses: an
+        // empty or one-address side is TooFew, a scrambled one is Irregular, and
+        // those must not be the same value.
+        let ordered = vec![(0.0, 1.0), (1.0, 3.0), (2.0, 5.0), (3.0, 7.0)];
+        assert_eq!(side_verdict(ordered.clone()), Side::Up);
+
+        // The factory side: nothing, or a single address for the whole complex.
+        assert_eq!(side_verdict(vec![]), Side::TooFew);
+        assert_eq!(side_verdict(vec![(1.5, 40.0)]), Side::TooFew);
+        assert_eq!(side_verdict(vec![(1.0, 40.0), (2.0, 42.0)]), Side::TooFew);
+
+        // …and a genuinely scrambled other side is a DIFFERENT verdict, or the
+        // split the report now makes would be a distinction without a
+        // difference.
+        let scrambled = vec![(0.0, 5.0), (1.0, 1.0), (2.0, 9.0), (3.0, 3.0)];
+        assert_ne!(side_verdict(scrambled.clone()), Side::TooFew);
+        assert_eq!(side_verdict(scrambled), Side::Irregular);
+    }
 
     #[test]
     fn the_decimal_preserves_the_order_a_human_reads_off_the_doors() {
