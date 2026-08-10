@@ -33,6 +33,9 @@ lance-graph-contract = { path = "../lance-graph/crates/lance-graph-contract", fe
 ogar-osm = { git = "https://github.com/AdaWorldAPI/OGAR.git", branch = "main" }
 ogar-vocab = { git = "https://github.com/AdaWorldAPI/OGAR.git", branch = "main" }
 
+[features]
+default = []
+
 [[bin]]
 name = "bake"
 path = "src/bin/bake.rs"

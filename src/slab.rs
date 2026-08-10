@@ -66,30 +66,43 @@ impl core::fmt::Debug for RowSlab<'_> {
 pub enum SlabError {
     /// Length is not a whole number of 512-byte rows.
     NotRowAligned { len: usize },
-    /// The base pointer does not meet `NodeRow`'s 64-byte alignment. An mmap
-    /// is page-aligned so this cannot happen for a whole mapped file; it can
-    /// for an arbitrary sub-slice, and casting anyway would be UB.
+    /// The base pointer does not meet `NodeRow`'s 64-byte alignment.
+    ///
+    /// **No longer returned by [`RowSlab::new`]** — alignment stopped being a
+    /// construction precondition when the lookup path moved off the cast (see
+    /// `new`'s doc). It survives as the vocabulary a CONSUMER uses to say why
+    /// [`RowSlab::rows`] returned `None`, which is where the requirement
+    /// actually lives now.
     Misaligned { align: usize },
 }
 
 impl<'a> RowSlab<'a> {
-    /// Wrap a byte range. Validates stride and alignment; copies nothing.
+    /// Wrap a byte range. Validates **stride only**; copies nothing.
     ///
-    /// An **empty** range is always valid and is not alignment-checked: an
-    /// empty slice carries a *dangling* pointer (`0x1` for `u8`), so demanding
-    /// 64-byte alignment of it would reject the legitimate zero-row case —
-    /// an extract with no resolvable features, or an empty sub-range of a
-    /// fragment. [`rows`](Self::rows) handles it symmetrically.
+    /// # Why alignment is NOT checked here (changed deliberately)
+    ///
+    /// An earlier version demanded `NodeRow`'s 64-byte alignment at
+    /// construction. That made the whole slab unusable over a buffer a real
+    /// producer hands back: **Lance's read path gives no alignment guarantee**
+    /// — 8-byte aligned, sometimes 64 by luck of allocator state. Measured
+    /// against a real dataset before that measurement's module was removed;
+    /// the finding survives the module because it is about arrow and Lance,
+    /// not about anything this crate wrote.
+    ///
+    /// The check was in the wrong place. **Nothing the slab does for a LOOKUP
+    /// needs the cast:** [`morton_at`](Self::morton_at) reads bytes at computed
+    /// offsets, so [`lower_bound`](Self::lower_bound) and
+    /// [`tile_range`](Self::tile_range) are byte arithmetic end to end. Only
+    /// [`rows`](Self::rows) — the `&[NodeRow]` projection — needs alignment,
+    /// and that is where the check now lives.
+    ///
+    /// This is what makes the borrow unconditional. Refusing here would have
+    /// left a caller with one lawful option, a copy — and zero copy is a law
+    /// without escape hatches, so a refusal that forces a copy is not a safe
+    /// default, it is the violation wearing a guard's clothes.
     pub fn new(bytes: &'a [u8]) -> Result<Self, SlabError> {
         if !bytes.len().is_multiple_of(NODE_ROW_STRIDE) {
             return Err(SlabError::NotRowAligned { len: bytes.len() });
-        }
-        if bytes.is_empty() {
-            return Ok(Self { bytes });
-        }
-        let align = core::mem::align_of::<NodeRow>();
-        if !(bytes.as_ptr() as usize).is_multiple_of(align) {
-            return Err(SlabError::Misaligned { align });
         }
         Ok(Self { bytes })
     }
@@ -105,30 +118,63 @@ impl<'a> RowSlab<'a> {
         self.bytes.is_empty()
     }
 
-    /// The rows, as rows. **This is the whole read path**: one cast.
+    /// The rows, as rows — one cast, still zero copy, but **conditional**.
+    ///
+    /// Returns `None` when the buffer is not 64-byte aligned. That is not a
+    /// failure to work around by copying: it means this particular projection
+    /// is unavailable over this buffer, while every LOOKUP operation
+    /// ([`morton_at`](Self::morton_at), [`lower_bound`](Self::lower_bound),
+    /// [`tile_range`](Self::tile_range)) remains available and borrowed,
+    /// because they read bytes rather than cast.
+    ///
+    /// An **empty** slab returns `Some(&[])`: an empty slice carries a dangling
+    /// pointer (`0x1` for `u8`), so demanding alignment of it would reject the
+    /// legitimate zero-row case.
     #[must_use]
-    pub fn rows(&self) -> &'a [NodeRow] {
+    pub fn rows(&self) -> Option<&'a [NodeRow]> {
         // The empty case returns without constructing a slice: an empty range
         // carries a dangling pointer, and `from_raw_parts` requires a properly
         // aligned pointer *even at length 0*. Passing `0x1` would be UB.
         if self.bytes.is_empty() {
-            return &[];
+            return Some(&[]);
+        }
+        if !(self.bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<NodeRow>()) {
+            return None;
         }
         // SAFETY: `new` proved the length is a whole number of 512-byte rows
         // and the base meets `NodeRow`'s alignment. `NodeRow` is
         // `#[repr(C, align(64))]` with a compile-asserted 512-byte size and no
         // padding-dependent semantics — the canon defines the row AS its
         // little-endian bytes.
-        unsafe { core::slice::from_raw_parts(self.bytes.as_ptr().cast::<NodeRow>(), self.len()) }
+        Some(unsafe {
+            core::slice::from_raw_parts(self.bytes.as_ptr().cast::<NodeRow>(), self.len())
+        })
+    }
+
+    /// The borrowed bytes themselves.
+    ///
+    /// Exists so a caller can prove the slab BORROWS — pointer identity is the
+    /// only way to tell a borrow from a well-optimised copy, and
+    /// [`rows`](Self::rows) cannot serve that purpose because it may decline.
+    #[must_use]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     /// Row `i`'s Morton code, read from its key's four cascade tiers.
     ///
     /// Read from the key bytes rather than through a tail accessor so it is
     /// independent of which `TailVariant` the classid resolves to.
+    ///
+    /// Reads the key BYTES at a computed offset rather than going through
+    /// [`rows`](Self::rows). That is not a micro-optimisation: it is what keeps
+    /// the entire lookup path free of `NodeRow`'s 64-byte alignment
+    /// requirement, so a Lance-returned buffer is borrowed rather than copied.
+    /// The bytes read are identical either way — the key's cascade tiers sit at
+    /// offsets 4..12 of the row, by the canon's own layout.
     #[must_use]
     pub fn morton_at(&self, i: usize) -> u64 {
-        let b = self.rows()[i].key.as_bytes();
+        let b = &self.bytes[i * NODE_ROW_STRIDE..];
         let t = |o: usize| u64::from(u16::from_le_bytes([b[o], b[o + 1]]));
         (t(4) << 48) | (t(6) << 32) | (t(8) << 16) | t(10)
     }
@@ -223,9 +269,12 @@ mod tests {
         let a = aligned(&raw);
         let s = RowSlab::new(&a.0[..raw.len()]).unwrap();
         assert_eq!(s.len(), 3);
-        assert_eq!(s.rows().len(), 3);
+        assert_eq!(s.rows().expect("aligned").len(), 3);
         // The cast lands on the same bytes the file holds — no copy, no decode.
-        assert_eq!(s.rows().as_ptr() as usize, a.0.as_ptr() as usize);
+        assert_eq!(
+            s.rows().expect("aligned").as_ptr() as usize,
+            a.0.as_ptr() as usize
+        );
         assert_eq!(s.morton_at(1), 2);
     }
 
@@ -244,7 +293,7 @@ mod tests {
         let s = RowSlab::new(empty).expect("an empty slab is valid");
         assert_eq!(s.len(), 0);
         assert!(s.is_empty());
-        assert!(s.rows().is_empty());
+        assert!(s.rows().expect("empty is always projectable").is_empty());
         // And a query over it answers empty rather than panicking.
         assert!(s.tile_range(14, 8802, 5373).is_empty());
         // The same via an empty Vec, which is how a zero-row file reads.
@@ -262,11 +311,25 @@ mod tests {
             RowSlab::new(&a.0[..500]).unwrap_err(),
             SlabError::NotRowAligned { len: 500 }
         );
-        assert!(matches!(
-            RowSlab::new(&a.0[8..8 + 512]).unwrap_err(),
-            SlabError::Misaligned { .. }
-        ));
-        assert!(RowSlab::new(&a.0[..512]).is_ok());
+        // An 8-offset sub-slice is NOT 64-aligned. It used to be refused at
+        // construction; now it CONSTRUCTS — and that is the point, because the
+        // lookup path does not need the cast. What it cannot do is hand out
+        // `&[NodeRow]`, and both halves are asserted so neither can silently
+        // change.
+        let unaligned = RowSlab::new(&a.0[8..8 + 512]).expect("construction no longer gates");
+        assert_eq!(unaligned.len(), 1, "the slab is usable");
+        assert!(
+            unaligned.rows().is_none(),
+            "…but the &[NodeRow] projection is unavailable over an unaligned buffer"
+        );
+        // Morton arithmetic works anyway — the whole reason for the change.
+        let _ = unaligned.morton_at(0);
+
+        let ok = RowSlab::new(&a.0[..512]).expect("aligned");
+        assert!(
+            ok.rows().is_some(),
+            "an aligned buffer keeps the projection"
+        );
     }
 
     #[test]

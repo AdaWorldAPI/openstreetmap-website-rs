@@ -1,0 +1,12 @@
+# Build context hygiene. `target/` is the big one — shipping it would send
+# hundreds of MB to the daemon for a builder stage that rebuilds from scratch
+# anyway, and a host-built artifact must never be mistaken for an image one.
+target/
+.git/
+.github/
+
+# Bake inputs/outputs are fetched or produced at run time, never baked into the
+# image: a .pbf is ~100 MB and a .soa is over a GiB.
+*.osm.pbf
+*.soa
+*.soa.books
