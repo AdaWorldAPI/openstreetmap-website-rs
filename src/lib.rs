@@ -7,6 +7,7 @@
 //! [`NodeRow`]: lance_graph_contract::canonical_node::NodeRow
 
 pub mod capability;
+pub mod chains;
 pub mod cluster;
 pub mod codebook;
 pub mod curve;

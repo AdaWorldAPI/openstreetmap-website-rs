@@ -255,6 +255,27 @@ fn anchor_relation(
 pub fn read_features(
     path: &str,
 ) -> Result<(Vec<Feature>, TagStore, ReadStats), Box<dyn std::error::Error>> {
+    let (features, store, stats, _chains) = read_features_with_chains(path)?;
+    Ok((features, store, stats))
+}
+
+/// What [`read_features_with_chains`] yields: features, the tag store, read
+/// stats, and each tagged way's vertex chain keyed by OSM way id.
+pub type ReadWithChains = (Vec<Feature>, TagStore, ReadStats, HashMap<i64, Vec<TileXy>>);
+
+/// [`read_features`], additionally returning each **tagged way's** full vertex
+/// chain (`osm way id -> z=32 cells, in ref order`).
+///
+/// The chain is the `cells` vec the way arm ALREADY builds to derive the
+/// anchor — this keeps it for tagged ways instead of dropping it, which is the
+/// entire difference. `bake` joins it to identity ordinals after
+/// `resolve_identities` and persists it as the `.chains` sidecar
+/// ([`crate::chains`]); the probes keep calling the dropping wrapper.
+///
+/// # Errors
+///
+/// Same as [`read_features`].
+pub fn read_features_with_chains(path: &str) -> Result<ReadWithChains, Box<dyn std::error::Error>> {
     let mut stats = ReadStats::default();
     let mut store = TagStore::default();
 
@@ -276,6 +297,7 @@ pub fn read_features(
     let mut out: Vec<Feature> = Vec::with_capacity(2_600_000);
     let mut ways_unresolved = 0u64;
     let mut way_centroid: PosMap = HashMap::with_capacity(1_400_000);
+    let mut way_chains: HashMap<i64, Vec<TileXy>> = HashMap::with_capacity(1_400_000);
     let mut pending: Vec<(i64, RawRelation)> = Vec::new();
     ElementReader::from_path(path)?.for_each(|el| match el {
         Element::Node(n) => {
@@ -327,6 +349,10 @@ pub fn read_features(
                     osm_id: w.id(),
                     tags,
                 });
+                // The shape was computed to derive the anchor; keep it instead
+                // of dropping it. Unresolved refs were already filtered above,
+                // so the chain holds only vertices pass 1 could place.
+                way_chains.insert(w.id(), cells);
             }
         }
         Element::Relation(r) => {
@@ -420,7 +446,7 @@ pub fn read_features(
         "tags: {} pairs, {} distinct keys, {} distinct values",
         stats.tag_pairs, stats.distinct_tag_keys, stats.distinct_tag_values,
     );
-    Ok((out, store, stats))
+    Ok((out, store, stats, way_chains))
 }
 
 #[cfg(test)]
