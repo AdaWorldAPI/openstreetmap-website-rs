@@ -25,7 +25,7 @@ fn main() {
     let (input, output) = (&args[1], &args[2]);
 
     let t0 = std::time::Instant::now();
-    let (features, tag_store, stats) = match read::read_features(input) {
+    let (features, tag_store, stats, way_chains) = match read::read_features_with_chains(input) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("read failed: {e}");
@@ -140,6 +140,38 @@ fn main() {
         .expect("write codebooks");
         w.flush().expect("flush codebooks");
     }
+    // ── The vertex chains, pinned to the same slab digest. ──
+    //
+    // Ordinals exist only after resolve_identities, so the join happens here:
+    // one entry per way IDENTITY (continuation rows share the ordinal and are
+    // deduped by the ordinal key), chain looked up by the way's osm id.
+    let chains_path = format!("{output}.chains");
+    let mut chain_recs: Vec<(u32, Vec<tms::TileXy>)> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for k in &keyed {
+            if k.entity_type != ogar_vocab::class_ids::OSM_WAY {
+                continue;
+            }
+            let Some(ordinal) = k.identity_ordinal else {
+                continue;
+            };
+            if !seen.insert(ordinal) {
+                continue; // a continuation row of a way already recorded
+            }
+            if let Some(chain) = way_chains.get(&k.osm_id) {
+                chain_recs.push((ordinal, chain.clone()));
+            }
+        }
+    }
+    let chained = chain_recs.len();
+    {
+        let f = std::fs::File::create(&chains_path).expect("create chains sidecar");
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        osm_soa_bake::chains::write_chains(&mut w, hasher.finish(), &mut chain_recs)
+            .expect("write chains");
+        w.flush().expect("flush chains");
+    }
     std::fs::rename(&tmp, output).expect("publish slab");
 
     // ── Report. Every number measured from what was emitted. ──
@@ -152,6 +184,7 @@ fn main() {
     println!("input                 {input}");
     println!("output                {output}");
     println!("codebooks             {books_path}");
+    println!("chains                {chains_path}  ({chained} ways)");
     println!("nodes indexed         {:>12}", stats.nodes_indexed);
     println!("tagged nodes          {:>12}", stats.tagged_nodes);
     println!("tagged ways           {:>12}", stats.tagged_ways);
