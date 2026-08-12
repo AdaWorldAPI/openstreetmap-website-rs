@@ -66,12 +66,12 @@
 //! Little-endian throughout, matching the slab it accompanies.
 //!
 //! ```text
-//! magic     8  b"OSMCBK\0\x02"
+//! magic     8  b"OSMCBK\0\x03"
 //! rows      8  u64 — rows the bake wrote
 //! slots     8  u64 — facet slots the bake filled (occupancy guard)
 //! slab      8  u64 — hash_slab of the slab this sidecar belongs to
 //! rounding  4  u32 — AnchorRounding discriminant; 0 is refused
-//! books     4  u32, always 3 (identity, tag keys, tag values)
+//! books     4  u32, always 4 (identity, tag keys, tag values, labels)
 //! per book:
 //!   digest  8  u64 — IdentityCodebook::digest of the entries that follow
 //!   count   4  u32
@@ -79,6 +79,24 @@
 //!     len   4  u32, byte length of the UTF-8 key
 //!     key   n  UTF-8, no terminator
 //! ```
+//!
+//! # The fourth book — labels (v3, `\x03`)
+//!
+//! `street.rs` needs a **name ordinal** to write into a junction's edge-name
+//! slot (`crate::street::NAME_SLOT`) — le-contract §2's ban on a label/position
+//! slot in the payload means the text itself can never live in the row. Reusing
+//! `tag_values` for this does not work: that book interns every tag value on
+//! every kept element (hundreds of thousands of entries, and a value's ordinal
+//! shifts whenever an unrelated tag changes), while `crate::street::NAME_SLOT`
+//! is a `u16` — the label book must fit **65,536 entries on its own terms**,
+//! not inherit whatever `tag_values` happens to hold. Measured on Berlin:
+//! 10,481 distinct routable-way names — 14 bits, nowhere near the ceiling.
+//!
+//! `\x02` bumped to `\x03` because a `\x02` reader that saw a 4-book file would
+//! stop after the third and silently treat the fourth book's leading bytes as
+//! the next record's header — [`BookError::BookCount`] catches the mismatch
+//! instead, but only because the version byte forces the check rather than
+//! letting an old binary attempt the read at all.
 //!
 //! Entries are written in **ordinal order**, which is sorted order because
 //! `try_new` sorts. Reading therefore hands the list straight back to `try_new`
@@ -155,10 +173,10 @@ pub struct Header {
 }
 
 /// File magic + format version.
-pub const MAGIC: [u8; 8] = *b"OSMCBK\0\x02";
+pub const MAGIC: [u8; 8] = *b"OSMCBK\0\x03";
 
-/// Books in the file, in order: identities, tag keys, tag values.
-pub const BOOKS: usize = 3;
+/// Books in the file, in order: identities, tag keys, tag values, labels.
+pub const BOOKS: usize = 4;
 
 /// What went wrong reading a sidecar.
 #[derive(Debug)]
@@ -238,17 +256,27 @@ impl From<std::io::Error> for BookError {
     }
 }
 
-/// The three books a bake produces.
+/// The four books a bake produces.
 #[derive(Debug)]
 pub struct Books {
     pub identities: IdentityCodebook,
     pub tag_keys: IdentityCodebook,
     pub tag_values: IdentityCodebook,
+    /// Street/way-name ordinals — `crate::street::NAME_SLOT`'s address space.
+    /// A **separate** book from `tag_values`: it must fit u16 on its own
+    /// terms (see the module docs), not inherit that book's much larger,
+    /// unrelated cardinality.
+    pub labels: IdentityCodebook,
 }
 
 impl Books {
     fn each(&self) -> [&IdentityCodebook; BOOKS] {
-        [&self.identities, &self.tag_keys, &self.tag_values]
+        [
+            &self.identities,
+            &self.tag_keys,
+            &self.tag_values,
+            &self.labels,
+        ]
     }
 }
 
@@ -351,6 +379,7 @@ pub fn read_books<R: Read>(r: &mut R) -> Result<(Header, Books), BookError> {
         identities: read_book(r, 0)?,
         tag_keys: read_book(r, 1)?,
         tag_values: read_book(r, 2)?,
+        labels: read_book(r, 3)?,
     };
     Ok((
         Header {
@@ -415,6 +444,7 @@ mod tests {
             identities: book(&["0f01:42", "0f02:42", "0f02:7"]),
             tag_keys: book(&["highway", "name"]),
             tag_values: book(&["residential", "Unter den Linden", "café"]),
+            labels: book(&["Unter den Linden", "Friedrichstraße"]),
         }
     }
 
@@ -441,6 +471,52 @@ mod tests {
             want.tag_values.ordinal("café")
         );
         assert!(got.tag_values.ordinal("café").is_some());
+
+        // The fourth book specifically: it must be its OWN address space, not
+        // a mirror of tag_values sharing the same ordinal for the same string.
+        // Both books happen to contain "Unter den Linden" here, and if the
+        // reader accidentally aliased the two books this would still pass —
+        // so the discriminating half is that the label book's ordinal space
+        // is independently u16-sized, checked by the dedicated test below.
+        assert_eq!(got.labels.len(), want.labels.len());
+        assert!(got.labels.ordinal("Unter den Linden").is_some());
+        assert!(got.labels.ordinal("Friedrichstraße").is_some());
+    }
+
+    #[test]
+    fn a_stale_three_book_file_is_refused_by_magic_not_silently_misread() {
+        // The whole reason for the version bump: a v2 (`\x02`) sidecar has 3
+        // books, and a `\x03` reader that ignored the magic and trusted the
+        // book count would read book 3 as whatever bytes happen to follow the
+        // third book's last entry — a wrong read, not a loud one. Bumping the
+        // magic means the file is refused before that can happen at all.
+        let three = Books {
+            identities: book(&["0f01:1"]),
+            tag_keys: book(&["highway"]),
+            tag_values: book(&["residential"]),
+            labels: book(&["Unter den Linden"]), // never written below
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"OSMCBK\0\x02"); // the OLD magic, verbatim
+        let h = head();
+        buf.extend_from_slice(&h.rows.to_le_bytes());
+        buf.extend_from_slice(&h.slots_written.to_le_bytes());
+        buf.extend_from_slice(&h.slab.to_le_bytes());
+        buf.extend_from_slice(&h.rounding.wire().to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes()); // v2's book count
+        for b in [&three.identities, &three.tag_keys, &three.tag_values] {
+            write_book(&mut buf, b).expect("write");
+        }
+        assert!(
+            matches!(read_books(&mut buf.as_slice()), Err(BookError::Magic(m)) if m == *b"OSMCBK\0\x02"),
+            "an old-format sidecar must be named as OUTDATED, not misread as v3"
+        );
+
+        // ...paired with the positive: a genuine v3 4-book file still reads,
+        // so the refusal is discriminating on the magic, not on book count.
+        let mut ok = Vec::new();
+        write_books(&mut ok, &head(), &sample()).expect("write");
+        assert!(read_books(&mut ok.as_slice()).is_ok());
     }
 
     #[test]

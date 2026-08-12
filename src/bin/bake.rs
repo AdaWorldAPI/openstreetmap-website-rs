@@ -11,10 +11,12 @@
 //! Rows are sorted by Morton code, so the file is in trie order: a tile prefix
 //! is a contiguous row range.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
+use lance_graph_contract::identity_quad::IdentityCodebook;
 use osm_soa_bake::codebook::{write_books, Books, Header, SlabHasher};
-use osm_soa_bake::{read, row, tms};
+use osm_soa_bake::{read, row, street, tms};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -25,13 +27,14 @@ fn main() {
     let (input, output) = (&args[1], &args[2]);
 
     let t0 = std::time::Instant::now();
-    let (features, tag_store, stats, way_chains) = match read::read_features_with_chains(input) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("read failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    let (features, tag_store, stats, way_chains, junctions) =
+        match read::read_features_with_chains(input) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("read failed: {e}");
+                std::process::exit(1);
+            }
+        };
     eprintln!("read in {:.1}s", t0.elapsed().as_secs_f64());
 
     // ── Resolve the tag codebooks, once, before anything is written. ──
@@ -55,10 +58,88 @@ fn main() {
         tags.values.digest(),
     );
 
+    // ── The label codebook + junction rows — street.rs's ABI, made real. ──
+    //
+    // Must run BEFORE `features` is consumed below: resolving a way's `name`
+    // needs its TagSpan against the resolved `tags`, and `features` is the
+    // only place that pairing still exists (junctions carry way IDS, not
+    // spans). Scoped to exactly the ways junctions actually reference —
+    // 463,010 routable ways is cheap to hold, but there is no reason to
+    // resolve a name for a way nothing will ever read.
+    let t_labels = std::time::Instant::now();
+    let referenced: HashSet<i64> = junctions
+        .iter()
+        .flat_map(|j| j.edge_ways.iter().copied())
+        .collect();
+    let mut way_name: HashMap<i64, String> = HashMap::with_capacity(referenced.len());
+    for f in &features {
+        if f.entity_type != read::OSM_WAY || !referenced.contains(&f.osm_id) {
+            continue;
+        }
+        for &pair in tags.span(f.tags) {
+            let Some((key, value)) = tags.text(pair) else {
+                continue;
+            };
+            if key == "name" {
+                way_name.insert(f.osm_id, value.to_string());
+                break;
+            }
+        }
+    }
+    let mut distinct_names: Vec<String> = way_name.values().cloned().collect();
+    distinct_names.sort_unstable();
+    distinct_names.dedup();
+    // `EdgeNames::ordinals` is `[u16; _]` — refuse rather than silently wrap
+    // an ordinal past 65,535 into a DIFFERENT name. `IdentityCodebook` itself
+    // permits up to 2^24-1; this is a NARROWER cap this format imposes.
+    if distinct_names.len() > u16::MAX as usize {
+        eprintln!(
+            "label codebook failed: {} distinct street names exceeds the u16              ordinal space this bake's edge-name slot uses",
+            distinct_names.len()
+        );
+        std::process::exit(1);
+    }
+    let labels = match IdentityCodebook::try_new(distinct_names) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("label codebook failed: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    let labels_len = labels.len();
+    let name_ordinal = |way_id: i64| -> u16 {
+        way_name
+            .get(&way_id)
+            .and_then(|n| labels.ordinal(n))
+            .map(|o| o as u16)
+            .unwrap_or(street::NAME_NONE)
+    };
+    let mut junction_rows: Vec<row::Keyed> = Vec::new();
+    for j in &junctions {
+        let names: Vec<u16> = j.edge_ways.iter().map(|&w| name_ordinal(w)).collect();
+        // An all-unnamed junction (every incident way lacks `name=*`, common
+        // for service roads) carries nothing worth a row — `junction_keyed`
+        // only skips a fully-EMPTY slice, so the all-zero-but-nonempty case
+        // is filtered here instead.
+        if names.iter().all(|&n| n == street::NAME_NONE) {
+            continue;
+        }
+        junction_rows.extend(row::junction_keyed(j, &names));
+    }
+    eprintln!(
+        "labels resolved in {:.1}s ({} distinct names, digest {:016x}) -> {} junction rows          from {} junction nodes",
+        t_labels.elapsed().as_secs_f64(),
+        labels.len(),
+        labels.digest(),
+        junction_rows.len(),
+        junctions.len(),
+    );
+
     // ── Key, sort into trie order, number collisions. ──
     let t1 = std::time::Instant::now();
     let mut keyed: Vec<row::Keyed> = features.iter().map(row::key_feature).collect();
     drop(features);
+    keyed.extend(junction_rows);
     let continuations = row::expand_tag_overflow(&mut keyed);
     keyed.sort_unstable_by_key(row::sort_key);
     let collisions = row::assign_identities(&mut keyed);
@@ -135,6 +216,7 @@ fn main() {
                 identities,
                 tag_keys: tags.keys.clone(),
                 tag_values: tags.values.clone(),
+                labels,
             },
         )
         .expect("write codebooks");
@@ -199,6 +281,12 @@ fn main() {
     println!("  distinct keys       {:>12}", stats.distinct_tag_keys);
     println!("  distinct values     {:>12}", stats.distinct_tag_values);
     println!("continuation rows     {:>12}", continuations);
+    println!("junction nodes        {:>12}", junctions.len());
+    println!(
+        "junction rows         {:>12}  ({} distinct street names)",
+        keyed.iter().filter(|k| k.edge_names.len > 0).count(),
+        labels_len,
+    );
     println!("facet slots written   {:>12}", slots_written);
     println!("slab digest           {:>12x}", hasher.finish());
     println!("ROWS                  {:>12}", keyed.len());

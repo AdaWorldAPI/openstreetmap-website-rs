@@ -85,7 +85,42 @@ use osm_soa_bake::cluster::{self, Facet};
 use osm_soa_bake::identity::read_identity;
 use osm_soa_bake::read::{self, Anchor};
 use osm_soa_bake::row::{self, Keyed};
-use osm_soa_bake::tms;
+use osm_soa_bake::{street, tms};
+
+/// Junction ground truth: `node_id -> ordered per-edge NAME STRINGS`
+/// (`None` = an unnamed incident way). Compared as STRINGS, not ordinals —
+/// so this check never has to reproduce the bake's own ordinal-assignment
+/// order to be trustworthy; it is a genuinely independent read of the same
+/// claim the bake makes.
+fn junction_truth(
+    junctions: &[read::Junction],
+    features: &[read::Feature],
+    tags: &osm_soa_bake::tags::ResolvedTags,
+) -> HashMap<i64, Vec<Option<String>>> {
+    let mut way_name: HashMap<i64, String> = HashMap::new();
+    for f in features {
+        if f.entity_type != read::OSM_WAY {
+            continue;
+        }
+        for &pair in tags.span(f.tags) {
+            if let Some(("name", value)) = tags.text(pair) {
+                way_name.insert(f.osm_id, value.to_string());
+                break;
+            }
+        }
+    }
+    junctions
+        .iter()
+        .map(|j| {
+            let names = j
+                .edge_ways
+                .iter()
+                .map(|w| way_name.get(w).cloned())
+                .collect();
+            (j.node_id, names)
+        })
+        .collect()
+}
 
 /// Load a slab file into an ALIGNED row vector.
 ///
@@ -138,14 +173,16 @@ fn main() {
     }
 
     // ── Ground truth: the extract itself. ──
-    let (features, tag_store, _stats) = match read::read_features(&args[1]) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("read failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    let (features, tag_store, _stats, _way_chains, junctions) =
+        match read::read_features_with_chains(&args[1]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("read failed: {e}");
+                std::process::exit(1);
+            }
+        };
     let tags = tag_store.resolve().expect("tag codebooks");
+    let want_junctions = junction_truth(&junctions, &features, &tags);
 
     // Ground truth keyed by the same (kind, osm_id) the bake identifies by.
     let mut truth: HashMap<(u16, i64), Truth> = HashMap::with_capacity(features.len());
@@ -157,7 +194,11 @@ fn main() {
     }
 
     // ── The rows to verify: from disk if given, else re-baked in-process. ──
-    let (book, rows): (_, Vec<NodeRow>) = if args.len() >= 4 {
+    let (book, labels, rows): (
+        _,
+        Option<lance_graph_contract::identity_quad::IdentityCodebook>,
+        Vec<NodeRow>,
+    ) = if args.len() >= 4 {
         let mut f = std::fs::File::open(&args[3]).expect("open codebooks");
         let (header, books) = match read_books(&mut f) {
             Ok(b) => b,
@@ -204,7 +245,7 @@ fn main() {
             "artifact pinned: {} rows, {} slots, rounding {:?}",
             header.rows, header.slots_written, header.rounding
         );
-        (books.identities, rows)
+        (books.identities, Some(books.labels), rows)
     } else {
         eprintln!("verifying the PIPELINE (no slab given) — weaker; see the module doc");
         let mut keyed: Vec<Keyed> = features.iter().map(row::key_feature).collect();
@@ -213,12 +254,19 @@ fn main() {
         row::assign_identities(&mut keyed);
         let book = row::resolve_identities(&mut keyed).expect("identity codebook");
         let rows = keyed.iter().map(|k| row::build_row(k, &tags)).collect();
-        (book, rows)
+        eprintln!("note: pipeline mode does not build junction rows — junction check skipped");
+        (book, None, rows)
     };
     drop(features);
 
     // ── Read every row back, using ONLY its bytes and the codebooks. ──
     let mut got: HashMap<u32, Recovered> = HashMap::with_capacity(rows.len());
+    // Junction edge-name ordinals, per identity ordinal. A junction split
+    // into continuation rows contributes from EACH row here — read order is
+    // not the split order (both share `tags.start == 0`, so the sort that
+    // placed them has no second key to break the tie on), which is why the
+    // diff below compares these as SORTED multisets, not as an ordered list.
+    let mut got_edge_names: HashMap<u32, Vec<u16>> = HashMap::new();
     for r in &rows {
         let r = *r;
         let (kind, ordinal) = match read_identity(&r) {
@@ -249,6 +297,15 @@ fn main() {
                 }
             }
         }
+
+        if kind == read::OSM_NODE {
+            for edge in 0..street::EDGE_SLOTS {
+                let n = street::edge_name(&r, edge);
+                if n != street::NAME_NONE {
+                    got_edge_names.entry(ordinal).or_default().push(n);
+                }
+            }
+        }
     }
 
     // ── Diff. ──
@@ -259,6 +316,16 @@ fn main() {
     let mut kind_bad = 0u64;
     let mut missing = 0u64;
     let mut shown = 0u32;
+
+    // Junction edge-name parity — SEPARATE from the tagged-feature diff
+    // above, because a junction has no tags at all and therefore no `truth`
+    // entry keyed by `(kind, osm_id)` to compare against; its ground truth is
+    // `want_junctions`, computed from the SAME extract by an independent walk
+    // (`junction_truth`, not `bake`'s pipeline). `labels` is `None` in
+    // pipeline mode, which never builds junction rows — nothing to check.
+    let (mut junction_checked, mut junction_ok, mut junction_bad, mut junction_unexpected) =
+        (0u64, 0u64, 0u64, 0u64);
+    let mut junction_shown = 0u32;
 
     for (ordinal, rec) in &got {
         // The ordinal pulls back to "kind:osm_id" through the codebook — the
@@ -271,8 +338,55 @@ fn main() {
         let kind = u16::from_str_radix(kind_hex, 16).expect("hex kind");
         let osm_id: i64 = id_str.parse().expect("numeric id");
 
+        // A junction row shares this ordinal with a tagged row when its node
+        // ALSO carries tags (e.g. `highway=traffic_signals`) — so this check
+        // runs unconditionally, whether or not `truth` has an entry below.
+        if let (Some(labels), Some(got_names)) = (labels.as_ref(), got_edge_names.get(ordinal)) {
+            let Some(want_names) = want_junctions.get(&osm_id) else {
+                junction_unexpected += 1;
+                continue;
+            };
+            junction_checked += 1;
+            // NAMED edges only, on both sides. An unnamed edge writes
+            // `NAME_NONE` (0) into its slot — indistinguishable, once on
+            // disk, from a slot the row's own `EdgeNames::len` never reached
+            // (both read back as plain zero bytes; that length is a
+            // `Keyed`-only fact, gone the moment `build_row` writes bytes).
+            // This matches `street.rs`'s own stated contract exactly:
+            // "unnamed edges are absent rather than pooled" — this format
+            // was never designed to reconstruct which SLOT an unnamed edge
+            // occupied, only which NAMES are present. Comparing named-only
+            // multisets is therefore the check this format's contract
+            // actually supports, not a weakening of a stronger one.
+            let mut got_strings: Vec<&str> = got_names
+                .iter()
+                .filter_map(|&o| labels.key(u32::from(o)))
+                .collect();
+            let mut want_strings: Vec<&str> =
+                want_names.iter().filter_map(|n| n.as_deref()).collect();
+            got_strings.sort_unstable();
+            want_strings.sort_unstable();
+            if got_strings == want_strings {
+                junction_ok += 1;
+            } else {
+                junction_bad += 1;
+                if junction_shown < 5 {
+                    junction_shown += 1;
+                    eprintln!(
+                        "junction mismatch node {osm_id} — bake {got_strings:?}, source {want_strings:?}"
+                    );
+                }
+            }
+        }
+
         let Some((want_anchor, want_tags)) = truth.get(&(kind, osm_id)) else {
-            missing += 1;
+            // A pure junction (untagged node) has no tagged-feature truth —
+            // that is EXPECTED and was just verified above, not a defect.
+            // Only route here to `missing` when it is genuinely unaccounted
+            // for by either mechanism.
+            if !got_edge_names.contains_key(ordinal) {
+                missing += 1;
+            }
             continue;
         };
         checked += 1;
@@ -344,12 +458,28 @@ fn main() {
     );
     println!("tags exact            {tags_ok:>12}   bad {tags_bad}");
 
+    println!("── junction (street.rs edge-name) parity ──");
+    println!("junction nodes         {:>12}", junctions.len());
+    println!(
+        "junctions w/ names     {:>12}",
+        want_junctions
+            .values()
+            .filter(|v| v.iter().any(Option::is_some))
+            .count()
+    );
+    println!(
+        "junction rows checked  {junction_checked:>12}   ok {junction_ok}   bad {junction_bad}"
+    );
+    println!("junction unexpected    {junction_unexpected:>12}   (a row's ordinal has no computed junction — should be 0)");
+
     let clean = unrecovered == 0
         && missing == 0
         && kind_bad == 0
         && node_pos_bad == 0
         && derived_pos_bad == 0
-        && tags_bad == 0;
+        && tags_bad == 0
+        && junction_bad == 0
+        && junction_unexpected == 0;
     println!(
         "\nVERDICT               {}",
         if clean { "PARITY" } else { "MISMATCH" }

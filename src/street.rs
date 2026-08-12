@@ -37,6 +37,32 @@
 //! class-resolved layout — *"Tetris it across the slots"*). [`NAME_SLOT`] is
 //! therefore a **proposed slot pending a ClassView**, addressed by slot index
 //! and never by a literal tenant offset.
+//!
+//! **`NAME_SLOT` = 1 (`ogar_osm::GEO_SLOPE_SLOT`) — measured, not guessed.**
+//! An earlier draft of this module moved it to value-local slot 2
+//! (`row::FIRST_TAG_SLOT`), reasoning that a junction row carries no ordinary
+//! tags so nothing else would ever write there. **That reasoning was correct
+//! about junction rows and wrong about every OTHER `osm_node` row.** Slot 2
+//! is where an ORDINARY tagged node's *first tag* lands — and this format has
+//! no byte that distinguishes "a junction row using NAME_SLOT" from "a
+//! tagged-POI row using its first tag slot" once the bytes are on disk. A
+//! reader (`parity`'s junction check) that tried slot 2 on every `osm_node`
+//! row measured **1,084,213 false hits on real Berlin data** — the exact
+//! count of tagged nodes carrying at least one tag, reinterpreting each
+//! node's first `Facet::Tag` bytes as eight raw `u16` name ordinals.
+//!
+//! Slot 1 has no such reader ambiguity: `GEO_SLOPE_SLOT` is written by
+//! **nothing** in the ordinary tag path (`row::FIRST_TAG_SLOT` starts one
+//! slot later, deliberately skipping it — see `row.rs`'s own doc, "a bake
+//! that packed tags into it would silently collide the day a slope lands").
+//! Junction rows are its first real, deliberate consumer; a future slope
+//! feature is a **later** decision that gets to pick where it lands with this
+//! precedent on the table, not a collision this module can silently walk
+//! into. Measured: `crates/tests` junction parity is clean at slot 1, and
+//! `row::tests::the_reserved_slope_slot_is_never_written_by_a_tag` (an
+//! ORDINARY row, `edge_names.len == 0`) is unaffected either way — the
+//! junction-write path never runs for that row regardless of which slot
+//! `NAME_SLOT` names.
 
 use lance_graph_contract::canonical_node::NodeRow;
 use lance_graph_contract::class_view::WideFieldMask;
@@ -46,10 +72,20 @@ use lance_graph_contract::class_view::WideFieldMask;
 pub const EDGE_SLOTS: u8 = 8;
 
 /// Value-slab slot holding this row's per-edge name ordinals, as
-/// `EDGE_SLOTS × u16`. Slot 1 of the 30 class-resolved slots.
+/// `EDGE_SLOTS × u16`. Value-local slot 1 = `ogar_osm::GEO_SLOPE_SLOT` — see
+/// the module docs for why this is the ONLY slot with no reader ambiguity.
 ///
 /// Proposed, pending a ClassView — see the module docs.
 pub const NAME_SLOT: usize = 1;
+
+// The invariant the module doc argues for, checked against the real
+// constant rather than restated as a number: NAME_SLOT must stay exactly on
+// the reserved slope slot (the one slot no ordinary tagged row ever writes),
+// never drift onto the tag range that starts immediately after it.
+const _: () = assert!(
+    NAME_SLOT == ogar_osm::GEO_SLOPE_SLOT - ogar_osm::RESERVED_SLOTS,
+    "NAME_SLOT must be exactly GEO_SLOPE_SLOT (value-local) — see module docs"
+);
 
 /// A name ordinal that means "no name" — the zero-fallback default, so an
 /// unnamed edge is *absent* rather than a member of street 0.
@@ -154,6 +190,7 @@ mod tests {
             identity_ordinal: None,
             identity: 0,
             tags: crate::tags::TagSpan::default(),
+            edge_names: crate::row::EdgeNames::default(),
         });
         set_edge_names(&mut r, names);
         r

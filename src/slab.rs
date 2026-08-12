@@ -243,6 +243,7 @@ mod tests {
                 identity_ordinal: None,
                 identity: 0,
                 tags: crate::tags::TagSpan::default(),
+                edge_names: crate::row::EdgeNames::default(),
             };
             let r = build_row_notags(&k);
             // SAFETY: same 512-byte ABI the baker writes.

@@ -255,13 +255,101 @@ fn anchor_relation(
 pub fn read_features(
     path: &str,
 ) -> Result<(Vec<Feature>, TagStore, ReadStats), Box<dyn std::error::Error>> {
-    let (features, store, stats, _chains) = read_features_with_chains(path)?;
+    let (features, store, stats, _chains, _junctions) = read_features_with_chains(path)?;
     Ok((features, store, stats))
 }
 
 /// What [`read_features_with_chains`] yields: features, the tag store, read
 /// stats, and each tagged way's vertex chain keyed by OSM way id.
-pub type ReadWithChains = (Vec<Feature>, TagStore, ReadStats, HashMap<i64, Vec<TileXy>>);
+pub type ReadWithChains = (
+    Vec<Feature>,
+    TagStore,
+    ReadStats,
+    HashMap<i64, Vec<TileXy>>,
+    Vec<Junction>,
+);
+
+/// `highway=*` values that carry no traffic of any mode — the same list
+/// `junction_probe`/`graph_probe` use, so the junction set this pipeline
+/// actually bakes matches the set those probes measured against. Kept as its
+/// own copy rather than a shared import: the probes are investigation tools
+/// that may drift independently, and the bake's copy is the one that must
+/// stay correct.
+const NON_ROUTABLE: &[&str] = &[
+    "construction",
+    "proposed",
+    "platform",
+    "raceway",
+    "bus_stop",
+    "street_lamp",
+    "traffic_sign",
+    "rest_area",
+    "services",
+];
+
+fn is_routable<'a>(mut tags: impl Iterator<Item = (&'a str, &'a str)>) -> bool {
+    match tags.find(|(k, _)| *k == "highway") {
+        Some((_, v)) => !NON_ROUTABLE.contains(&v),
+        None => false,
+    }
+}
+
+/// A node shared by two or more routable ways — the population
+/// `junction_probe` (P12) measures as `routable_ref >= 2`, computed the same
+/// way here: **occurrences**, not distinct ways. A way that touches the same
+/// node twice (a loop back through it) contributes two occurrences, and both
+/// become their own edge slot — the node really does carry two of that way's
+/// segment-ends there.
+#[derive(Debug, Clone)]
+pub struct Junction {
+    pub node_id: i64,
+    pub cell: TileXy,
+    /// Way ids touching this junction, one entry per occurrence, in the
+    /// deterministic (way id, then position within that way) order
+    /// [`build_junctions`] walks them — never insertion order from the PBF
+    /// reader, which is not guaranteed stable across reads.
+    pub edge_ways: Vec<i64>,
+}
+
+/// Build the junction set from a routable way's `(id, ordered node refs)`
+/// list. Two passes over already-in-memory data (no PBF re-read): count
+/// occurrences per node, then re-walk to collect each junction's edge-way
+/// list in a fixed order.
+fn build_junctions(routable_ways: &mut [(i64, Vec<i64>)], coords: &PosMap) -> Vec<Junction> {
+    routable_ways.sort_unstable_by_key(|(id, _)| *id);
+
+    let mut occurrences: HashMap<i64, u32> = HashMap::with_capacity(routable_ways.len() * 4);
+    for (_, nodes) in routable_ways.iter() {
+        for n in nodes {
+            *occurrences.entry(*n).or_insert(0) += 1;
+        }
+    }
+
+    let mut edges: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (way_id, nodes) in routable_ways.iter() {
+        for n in nodes {
+            if occurrences.get(n).copied().unwrap_or(0) >= 2 {
+                edges.entry(*n).or_default().push(*way_id);
+            }
+        }
+    }
+
+    let mut out: Vec<Junction> = edges
+        .into_iter()
+        .filter_map(|(node_id, edge_ways)| {
+            coords.get(&node_id).map(|&cell| Junction {
+                node_id,
+                cell,
+                edge_ways,
+            })
+        })
+        .collect();
+    // Deterministic output order: two bakes of one extract must be
+    // byte-identical, matching the guarantee `row::sort_key` already gives
+    // the rest of the pipeline.
+    out.sort_unstable_by_key(|j| j.node_id);
+    out
+}
 
 /// [`read_features`], additionally returning each **tagged way's** full vertex
 /// chain (`osm way id -> z=32 cells, in ref order`).
@@ -299,6 +387,12 @@ pub fn read_features_with_chains(path: &str) -> Result<ReadWithChains, Box<dyn s
     let mut way_centroid: PosMap = HashMap::with_capacity(1_400_000);
     let mut way_chains: HashMap<i64, Vec<TileXy>> = HashMap::with_capacity(1_400_000);
     let mut pending: Vec<(i64, RawRelation)> = Vec::new();
+    // Routable ways' raw node-id lists, for junction detection after this
+    // pass — kept separate from `way_chains` (which holds resolved CELLS for
+    // every tagged way, routable or not) because junction detection needs
+    // node IDENTITY, which a cell cannot give back once two ids round to the
+    // same quantized cell.
+    let mut routable_ways: Vec<(i64, Vec<i64>)> = Vec::with_capacity(480_000);
     ElementReader::from_path(path)?.for_each(|el| match el {
         Element::Node(n) => {
             if n.tags().next().is_some() {
@@ -334,6 +428,13 @@ pub fn read_features_with_chains(path: &str) -> Result<ReadWithChains, Box<dyn s
             // and that member still has to resolve.
             let cells: Vec<TileXy> = w.refs().filter_map(|id| coords.get(&id).copied()).collect();
             let tagged = w.tags().next().is_some();
+            // Routability needs the ORIGINAL tag iterator, so this is checked
+            // before `store.push(w.tags())` below consumes it — `w.tags()`
+            // itself is a fresh iterator per call (cheap; the way is already
+            // decoded), so calling it twice costs no re-parse.
+            if is_routable(w.tags()) {
+                routable_ways.push((w.id(), w.refs().collect()));
+            }
             let Some(c) = mean_cell(&cells) else {
                 if tagged {
                     ways_unresolved += 1;
@@ -446,7 +547,13 @@ pub fn read_features_with_chains(path: &str) -> Result<ReadWithChains, Box<dyn s
         "tags: {} pairs, {} distinct keys, {} distinct values",
         stats.tag_pairs, stats.distinct_tag_keys, stats.distinct_tag_values,
     );
-    Ok((out, store, stats, way_chains))
+    let junctions = build_junctions(&mut routable_ways, &coords);
+    eprintln!(
+        "junctions: {} routable ways -> {} junction nodes",
+        routable_ways.len(),
+        junctions.len(),
+    );
+    Ok((out, store, stats, way_chains, junctions))
 }
 
 #[cfg(test)]
@@ -469,6 +576,96 @@ mod tests {
         // every name to one id, and it refuses a name it does not carry.
         assert_ne!(OsmPort::class_id("Node"), OsmPort::class_id("Way"));
         assert_eq!(OsmPort::class_id("Tracepoint"), None);
+    }
+
+    fn cell(x: u32, y: u32) -> TileXy {
+        TileXy { x, y_xyz: y }
+    }
+
+    #[test]
+    fn a_node_shared_by_two_ways_is_a_junction_the_others_are_not() {
+        // A T: way 1 runs 10-11-12, way 2 runs 20-11-21. Node 11 is the
+        // shared vertex; every other node belongs to exactly one way.
+        let mut coords: PosMap = HashMap::new();
+        for (id, xy) in [
+            (10, cell(0, 0)),
+            (11, cell(1, 0)),
+            (12, cell(2, 0)),
+            (20, cell(1, 1)),
+            (21, cell(1, 2)),
+        ] {
+            coords.insert(id, xy);
+        }
+        let mut ways = vec![(1i64, vec![10, 11, 12]), (2i64, vec![20, 11, 21])];
+
+        let junctions = build_junctions(&mut ways, &coords);
+
+        assert_eq!(junctions.len(), 1, "exactly one shared node");
+        let j = &junctions[0];
+        assert_eq!(j.node_id, 11);
+        assert_eq!(j.cell, cell(1, 0));
+        // Deterministic order: ways sorted by id, so way 1 before way 2.
+        assert_eq!(j.edge_ways, vec![1, 2]);
+
+        // ...and it's genuinely discriminating: nodes 10/12/20/21, each
+        // touched by exactly one way exactly once, must NOT appear at all.
+        for solo in [10, 12, 20, 21] {
+            assert!(
+                !junctions.iter().any(|j| j.node_id == solo),
+                "node {solo} is not shared and must not be a junction"
+            );
+        }
+    }
+
+    #[test]
+    fn a_way_that_loops_back_through_one_node_contributes_two_edge_occurrences() {
+        // Way 1 visits node 5 twice (a lasso shape: 1-2-5-3-4-5-1-back-out via
+        // a second way so 5 also qualifies via a real second reference — a
+        // SOLE way revisiting its own node must still not, by itself, count
+        // as "shared" under the >=2-DISTINCT-touch population definition this
+        // module measures against junction_probe; what's under test here is
+        // that once a node DOES qualify (via way 2), every occurrence across
+        // ALL ways — including a repeated one within a single way — becomes
+        // its own edge slot, not deduplicated to one.
+        let mut coords: PosMap = HashMap::new();
+        for (id, xy) in [(1, cell(0, 0)), (2, cell(1, 0)), (5, cell(2, 0))] {
+            coords.insert(id, xy);
+        }
+        let mut ways = vec![(1i64, vec![1, 5, 2, 5]), (2i64, vec![5, 1])];
+
+        let junctions = build_junctions(&mut ways, &coords);
+        let j = junctions
+            .iter()
+            .find(|j| j.node_id == 5)
+            .expect("node 5 qualifies (way 2 also touches it)");
+        // Way 1 visits node 5 at two positions -> two entries of way id 1;
+        // way 2 visits it once -> one entry of way id 2. Three total, not
+        // deduplicated to "which ways touch this node".
+        assert_eq!(j.edge_ways, vec![1, 1, 2]);
+
+        // Node 1 is touched once by way 1 and once by way 2 -> a genuine
+        // 2-way junction too, one entry each.
+        let j1 = junctions
+            .iter()
+            .find(|j| j.node_id == 1)
+            .expect("node 1 also qualifies");
+        assert_eq!(j1.edge_ways, vec![1, 2]);
+
+        // Node 2 is touched ONLY by way 1, at one position -> not a junction.
+        assert!(!junctions.iter().any(|j| j.node_id == 2));
+    }
+
+    #[test]
+    fn a_junction_node_with_no_resolved_coordinate_is_dropped_not_fabricated() {
+        // Pass 1 indexes every node it sees; a way that references a node id
+        // pass 1 never saw (a real, if rare, extract inconsistency) must not
+        // produce a junction row keyed at a made-up position.
+        let mut coords: PosMap = HashMap::new();
+        coords.insert(10, cell(0, 0)); // node 11 deliberately absent
+        let mut ways = vec![(1i64, vec![10, 11]), (2i64, vec![10, 11])];
+        let junctions = build_junctions(&mut ways, &coords);
+        assert_eq!(junctions.len(), 1, "only the resolvable junction ships");
+        assert_eq!(junctions[0].node_id, 10);
     }
 
     fn maps() -> (PosMap, PosMap) {
