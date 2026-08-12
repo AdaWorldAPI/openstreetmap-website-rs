@@ -11,8 +11,27 @@ use lance_graph_contract::canonical_node::{EdgeBlock, NodeGuid, NodeRow, TailVar
 use lance_graph_contract::identity_quad::{CodebookError, IdentityCodebook};
 
 use crate::read::Feature;
+use crate::street;
 use crate::tags::{ResolvedTags, TagSpan};
 use crate::tms::{self, Tiers};
+
+/// Row-local edge-name payload for a junction row's [`street::NAME_SLOT`].
+/// Fixed-size, not `Vec` — so [`Keyed`] stays `Copy`, matching the fixed-
+/// capacity-plus-continuation shape [`TAGS_PER_ROW`]/[`expand_tag_overflow`]
+/// already use for tags, at the width [`street::EDGE_SLOTS`] commits to.
+/// `len == 0` (the default) means "nothing to write" — an ordinary row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeNames {
+    pub ordinals: [u16; street::EDGE_SLOTS as usize],
+    pub len: u8,
+}
+
+impl EdgeNames {
+    #[must_use]
+    pub fn as_slice(&self) -> &[u16] {
+        &self.ordinals[..self.len as usize]
+    }
+}
 
 /// Tag facets one row can carry: everything after the key, edges, identity and
 /// the reserved slope slot.
@@ -87,6 +106,17 @@ pub struct Keyed {
     /// reassembles a feature by grouping rows on `(kind, ordinal)`, never by
     /// row adjacency.
     pub tags: TagSpan,
+    /// Raw label-codebook ordinals for [`crate::street::NAME_SLOT`], written
+    /// verbatim (never through `tags`/`ResolvedTags` — this is a SEPARATE,
+    /// small codebook; see `codebook.rs`'s "fourth book" docs). Empty for
+    /// every ordinary row.
+    ///
+    /// A junction with more than [`crate::street::EDGE_SLOTS`] named edges
+    /// gets split into several `Keyed`s here too, the SAME pattern
+    /// [`expand_tag_overflow`] uses for tags: identical identity, disjoint
+    /// slices, grouped back together by `(kind, ordinal)` on read. See
+    /// [`junction_keyed`].
+    pub edge_names: EdgeNames,
 }
 
 /// Key a feature: TMS Morton at z=32 → four cascade tiers.
@@ -105,6 +135,7 @@ pub fn key_feature(f: &Feature) -> Keyed {
         identity_ordinal: None,
         identity: 0,
         tags: f.tags,
+        edge_names: EdgeNames::default(),
     }
 }
 
@@ -116,6 +147,57 @@ pub fn key_feature(f: &Feature) -> Keyed {
 /// and a bake that silently truncated instead would drop tags from exactly the
 /// richest features (the ones a renderer most needs).
 ///
+/// Build one or more `Keyed` rows for a junction, given its resolved
+/// per-edge name ordinals — the same "fixed bucket + continuation" pattern as
+/// [`expand_tag_overflow`], applied to [`EdgeNames`] instead of [`TagSpan`].
+///
+/// `names` may be **longer** than [`crate::street::EDGE_SLOTS`] (the P12
+/// measurement found exactly this on real data: 619,739 of 619,740 Berlin
+/// junctions fit within 8 slots, one did not). Rather than silently truncate
+/// — dropping the tail edges' street identity, the exact defect the
+/// occupancy guard elsewhere in this bake exists to make impossible — this
+/// splits into `ceil(names.len() / EDGE_SLOTS)` rows sharing one identity
+/// key, so `resolve_identities` collapses them to one ordinal and a reader
+/// groups them back by `(kind, ordinal)` exactly as a tag continuation.
+///
+/// A junction with NO named edges (every incident way is `highway=*` with no
+/// `name` tag — common for service roads) produces **zero** rows: nothing to
+/// resolve, nothing to look up, and no row occupying space for an all-zero
+/// payload that `edge_mask` would read as empty anyway.
+#[must_use]
+pub fn junction_keyed(j: &crate::read::Junction, names: &[u16]) -> Vec<Keyed> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let morton = tms::cell_to_morton(j.cell);
+    let tiers = tms::tiers_of(morton);
+    let base = Keyed {
+        morton,
+        tiers,
+        entity_type: crate::read::OSM_NODE,
+        osm_id: j.node_id,
+        identity_ordinal: None,
+        identity: 0,
+        tags: TagSpan::default(),
+        edge_names: EdgeNames::default(),
+    };
+    let per = street::EDGE_SLOTS as usize;
+    names
+        .chunks(per)
+        .map(|chunk| {
+            let mut ordinals = [0u16; street::EDGE_SLOTS as usize];
+            ordinals[..chunk.len()].copy_from_slice(chunk);
+            Keyed {
+                edge_names: EdgeNames {
+                    ordinals,
+                    len: chunk.len() as u8,
+                },
+                ..base
+            }
+        })
+        .collect()
+}
+
 /// Continuations are not marked as such, deliberately. Each carries the same
 /// identity facet, so a reader reassembles a feature by grouping on
 /// `(kind, ordinal)` — order-independent, and correct even if rows are shuffled
@@ -218,6 +300,12 @@ pub fn build_row(k: &Keyed, tags: &ResolvedTags) -> NodeRow {
                 crate::cluster::write_tag(&mut row, FIRST_TAG_SLOT + i, ordinal, key, value);
             debug_assert!(wrote, "tag ({key}, {value}) was refused for slot {i}");
         }
+    }
+    if k.edge_names.len > 0 {
+        // A junction row: no ordinary tags (checked above — `k.tags` is
+        // `TagSpan::default()` for every junction `Keyed`, so the loop above
+        // wrote nothing), its whole payload is this slot.
+        street::set_edge_names(&mut row, k.edge_names.as_slice());
     }
     row
 }
@@ -586,6 +674,72 @@ mod tests {
             "reassembly must be lossless and in order"
         );
         assert_eq!(seen.len(), n as usize);
+    }
+
+    fn junction_at(node_id: i64, lon: f64, lat: f64) -> crate::read::Junction {
+        crate::read::Junction {
+            node_id,
+            cell: crate::tms::point_to_cell(lon, lat),
+            edge_ways: Vec::new(), // unused by junction_keyed; names are pre-resolved
+        }
+    }
+
+    #[test]
+    fn a_junction_with_no_named_edges_produces_no_row() {
+        // Every incident way unnamed (NAME_NONE) is the common case — a
+        // service-road junction. It must cost nothing, not a row of zeros.
+        let j = junction_at(1, 13.4, 52.5);
+        assert!(junction_keyed(&j, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_junction_within_the_edge_budget_produces_exactly_one_row() {
+        let j = junction_at(2, 13.4, 52.5);
+        let names = [7u16, 9, 7];
+        let rows = junction_keyed(&j, &names);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].edge_names.as_slice(), &names[..]);
+        assert_eq!(rows[0].entity_type, crate::read::OSM_NODE);
+        assert_eq!(rows[0].osm_id, 2);
+        assert!(
+            rows[0].tags.len == 0,
+            "a junction row carries no ordinary tags — its payload is edge_names alone"
+        );
+    }
+
+    #[test]
+    fn a_junction_over_the_edge_budget_splits_into_continuations_sharing_one_identity() {
+        // The measured P12 case: one Berlin junction exceeded EDGE_SLOTS.
+        // Two-sided on the boundary, same discipline as the tag-overflow test
+        // above: exactly EDGE_SLOTS must NOT split, one more must.
+        let j = junction_at(3, 13.4, 52.5);
+        let at_bound: Vec<u16> = (1..=street::EDGE_SLOTS as u16).collect();
+        assert_eq!(
+            junction_keyed(&j, &at_bound).len(),
+            1,
+            "a full bucket must not split"
+        );
+
+        let over: Vec<u16> = (1..=street::EDGE_SLOTS as u16 + 3).collect();
+        let mut rows = junction_keyed(&j, &over);
+        assert_eq!(
+            rows.len(),
+            2,
+            "9 more slots than the budget covers -> 2 rows"
+        );
+        resolve_identities(&mut rows).unwrap();
+
+        // Same identity key on both — a reader groups them as ONE junction.
+        assert_eq!(rows[0].identity_ordinal, rows[1].identity_ordinal);
+        assert!(rows[0].identity_ordinal.is_some());
+
+        // Nothing lost, nothing duplicated: the union of both rows' edge
+        // names, in order, reproduces the input exactly.
+        let mut reassembled: Vec<u16> = Vec::new();
+        for r in &rows {
+            reassembled.extend_from_slice(r.edge_names.as_slice());
+        }
+        assert_eq!(reassembled, over);
     }
 
     #[test]
