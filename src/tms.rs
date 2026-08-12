@@ -110,16 +110,51 @@ pub fn xyz_to_tms_y(z: u32, y: u32) -> u32 {
     ((n - 1).saturating_sub(u64::from(y))) as u32
 }
 
+/// Spread the low 32 bits of `x` so a zero bit sits between every original
+/// bit — the classic O(1) "binary magic numbers" interleave step (5 fixed
+/// shift-mask-or stages instead of a 32-iteration loop). Exact bit-for-bit
+/// replacement for what the old scalar loop computed one bit at a time;
+/// verified against it in `morton_fast_matches_the_scalar_reference` below.
+#[inline]
+#[must_use]
+fn spread_bits(x: u64) -> u64 {
+    let mut x = x & 0x0000_0000_ffff_ffff;
+    x = (x | (x << 16)) & 0x0000_ffff_0000_ffff;
+    x = (x | (x << 8)) & 0x00ff_00ff_00ff_00ff;
+    x = (x | (x << 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    x = (x | (x << 2)) & 0x3333_3333_3333_3333;
+    x = (x | (x << 1)) & 0x5555_5555_5555_5555;
+    x
+}
+
+/// Inverse of [`spread_bits`]: compact every other bit (starting at bit 0)
+/// of `x` back into the low 32 bits.
+#[inline]
+#[must_use]
+fn compact_bits(x: u64) -> u64 {
+    let mut x = x & 0x5555_5555_5555_5555;
+    x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
+    x = (x | (x >> 2)) & 0x0f0f_0f0f_0f0f_0f0f;
+    x = (x | (x >> 4)) & 0x00ff_00ff_00ff_00ff;
+    x = (x | (x >> 8)) & 0x0000_ffff_0000_ffff;
+    x = (x | (x >> 16)) & 0x0000_0000_ffff_ffff;
+    x
+}
+
 /// Interleave two 32-bit lanes into a 64-bit Morton code (`x`→even bits,
 /// `y`→odd bits). This is the trie: a shared prefix IS a shared tile, exactly.
+///
+/// **O(1), not O(depth).** This used to be a 32-iteration bit-by-bit loop;
+/// baking a Berlin-class region calls this once per node (millions of
+/// times), and `demorton64` — the same trick, below — sits on q2's
+/// tile-serving hot path (`osm_features::query_tile` decodes one Morton
+/// code per served row, up to hundreds of thousands per city-zoom
+/// response). [`spread_bits`] replaces the loop with 5 fixed shift-mask-or
+/// stages; verified bit-for-bit equivalent to the old loop, not merely
+/// assumed faster-and-equal.
 #[must_use]
 pub fn morton64(x: u32, y: u32) -> u64 {
-    let mut code = 0u64;
-    for i in 0..HHTL_DEPTH4 {
-        code |= u64::from((x >> i) & 1) << (2 * i);
-        code |= u64::from((y >> i) & 1) << (2 * i + 1);
-    }
-    code
+    spread_bits(u64::from(x)) | (spread_bits(u64::from(y)) << 1)
 }
 
 /// `(lon, lat)` → the Cesium-TMS Morton code at z=32.
@@ -287,16 +322,12 @@ pub fn mean_cell(cells: &[TileXy]) -> Option<TileXy> {
 // bound says the answer is *close*, and OSM parity needs it *exact*.
 
 /// De-interleave a 64-bit Morton code into its two 32-bit lanes.
-/// Exact inverse of [`morton64`].
+/// Exact inverse of [`morton64`]. See that function's doc for why this is
+/// O(1) rather than a 32-iteration loop — this is the half of the trick
+/// that runs on the tile-serving hot path.
 #[must_use]
 pub fn demorton64(code: u64) -> (u32, u32) {
-    let mut x = 0u32;
-    let mut y = 0u32;
-    for i in 0..HHTL_DEPTH4 {
-        x |= (((code >> (2 * i)) & 1) as u32) << i;
-        y |= (((code >> (2 * i + 1)) & 1) as u32) << i;
-    }
-    (x, y)
+    (compact_bits(code) as u32, compact_bits(code >> 1) as u32)
 }
 
 /// XYZ tile `(x, y)` at z=32 → the **centre** of that tile, in degrees.
@@ -509,6 +540,94 @@ mod tests {
             (0xdead_beef, 0x0bad_f00d),
         ] {
             assert_eq!(demorton64(morton64(x, y)), (x, y));
+        }
+    }
+
+    /// The scalar, bit-by-bit loop `morton64`/`demorton64` used before the
+    /// O(1) magic-bits rewrite above — kept ONLY here, as the falsifiable
+    /// reference the fast version is checked against. Never call this from
+    /// non-test code; it exists so "faster" and "identical" are both proven,
+    /// not just the first one.
+    fn morton64_scalar_reference(x: u32, y: u32) -> u64 {
+        let mut code = 0u64;
+        for i in 0..HHTL_DEPTH4 {
+            code |= u64::from((x >> i) & 1) << (2 * i);
+            code |= u64::from((y >> i) & 1) << (2 * i + 1);
+        }
+        code
+    }
+
+    fn demorton64_scalar_reference(code: u64) -> (u32, u32) {
+        let mut x = 0u32;
+        let mut y = 0u32;
+        for i in 0..HHTL_DEPTH4 {
+            x |= (((code >> (2 * i)) & 1) as u32) << i;
+            y |= (((code >> (2 * i + 1)) & 1) as u32) << i;
+        }
+        (x, y)
+    }
+
+    /// Deterministic, dependency-free PRNG (splitmix64) — this crate has no
+    /// `rand`/`proptest` dev-dependency, and a fixed seed makes a failure
+    /// reproducible without one.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// **The falsifier for the O(1) rewrite.** Proves `morton64`/`demorton64`
+    /// (magic-bits) agree bit-for-bit with the original scalar loop across
+    /// 200,000 pseudo-random 32-bit pairs and codes, plus the boundary
+    /// patterns a random sweep is least likely to hit by chance. A silent
+    /// divergence here would corrupt the Morton SORT KEY every baked slab is
+    /// ordered by — this is not a performance nice-to-have, it is the proof
+    /// the speedup changed no observable behaviour.
+    #[test]
+    fn morton_fast_matches_the_scalar_reference() {
+        let boundary_pairs = [
+            (0u32, 0u32),
+            (u32::MAX, u32::MAX),
+            (u32::MAX, 0),
+            (0, u32::MAX),
+            (0xAAAA_AAAA, 0x5555_5555),
+            (0x5555_5555, 0xAAAA_AAAA),
+            (1, 1 << 31),
+            (1 << 31, 1),
+        ];
+        for (x, y) in boundary_pairs {
+            assert_eq!(
+                morton64(x, y),
+                morton64_scalar_reference(x, y),
+                "morton64({x:#010x}, {y:#010x}) diverged from the scalar reference"
+            );
+        }
+        let boundary_codes = [0u64, u64::MAX, 0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555];
+        for code in boundary_codes {
+            assert_eq!(
+                demorton64(code),
+                demorton64_scalar_reference(code),
+                "demorton64({code:#018x}) diverged from the scalar reference"
+            );
+        }
+
+        let mut state = 0x2026_0812_u64; // fixed seed — reproducible on failure
+        for _ in 0..200_000 {
+            let x = splitmix64(&mut state) as u32;
+            let y = splitmix64(&mut state) as u32;
+            assert_eq!(
+                morton64(x, y),
+                morton64_scalar_reference(x, y),
+                "morton64({x:#010x}, {y:#010x}) diverged from the scalar reference"
+            );
+            let code = splitmix64(&mut state);
+            assert_eq!(
+                demorton64(code),
+                demorton64_scalar_reference(code),
+                "demorton64({code:#018x}) diverged from the scalar reference"
+            );
         }
     }
 
