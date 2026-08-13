@@ -13,6 +13,7 @@ pub mod codebook;
 pub mod curve;
 pub mod fragment;
 pub mod geodesy;
+pub mod heading;
 pub mod identity;
 pub mod project;
 pub mod read;
