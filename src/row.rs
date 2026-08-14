@@ -174,7 +174,13 @@ pub fn junction_keyed(j: &crate::read::Junction, names: &[u16]) -> Vec<Keyed> {
     let base = Keyed {
         morton,
         tiers,
-        entity_type: crate::read::OSM_NODE,
+        // The DERIVED concept, not the published node it sits on. A junction
+        // IS an `osm_node` upstream, so both rows would otherwise key on the
+        // same `identity_key` (`{entity_type:04x}:{osm_id}`) and
+        // `resolve_identities` would collapse them to one ordinal — leaving
+        // nothing on disk to tell a junction from a tagged POI. That is the
+        // ambiguity `crate::street`'s docs measured at 1,084,213 false hits.
+        entity_type: crate::read::OSM_STREET_NODE,
         osm_id: j.node_id,
         identity_ordinal: None,
         identity: 0,
@@ -699,12 +705,61 @@ mod tests {
         let rows = junction_keyed(&j, &names);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].edge_names.as_slice(), &names[..]);
-        assert_eq!(rows[0].entity_type, crate::read::OSM_NODE);
+        // RE-PINNED: this asserted `OSM_NODE` until `osm_street_node` (0x0F0B)
+        // was minted. The old value was not a neutral fact being recorded — it
+        // was the ambiguity itself, certified as expected behaviour by a green
+        // test. See `a_junction_row_is_a_street_node_not_a_plain_node`.
+        assert_eq!(rows[0].entity_type, crate::read::OSM_STREET_NODE);
         assert_eq!(rows[0].osm_id, 2);
         assert!(
             rows[0].tags.len == 0,
             "a junction row carries no ordinary tags — its payload is edge_names alone"
         );
+    }
+
+    /// A junction row must be distinguishable from an ordinary node row by
+    /// the row's own bytes — the whole reason `osm_street_node` (`0x0F0B`)
+    /// was minted.
+    ///
+    /// Two-sided, and the second half is what makes it a real falsifier: a
+    /// junction is ALSO a published OSM node, so both rows carry the same
+    /// `osm_id`. If the junction kept stamping `OSM_NODE`, `identity_key`
+    /// would produce the identical string for both, `resolve_identities`
+    /// would collapse them to ONE ordinal, and nothing on disk would separate
+    /// them — which is exactly the state that cost 1,084,213 false hits when
+    /// a reader tried to tell them apart by slot occupancy instead.
+    #[test]
+    fn a_junction_row_is_a_street_node_not_a_plain_node() {
+        let node_id = 4_242;
+        let j = junction_at(node_id, 13.4, 52.5);
+        let mut rows = junction_keyed(&j, &[7u16, 9]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entity_type,
+            crate::read::OSM_STREET_NODE,
+            "a junction is the derived concept, not the published node"
+        );
+
+        // The same OSM node, keyed as an ordinary node — the collision case.
+        let plain = Keyed {
+            entity_type: crate::read::OSM_NODE,
+            ..rows[0]
+        };
+        rows.push(plain);
+        resolve_identities(&mut rows).unwrap();
+        assert_ne!(
+            rows[0].identity_ordinal, rows[1].identity_ordinal,
+            "junction and node share an osm_id; only the KIND separates them, \
+             so a shared ordinal means the kind is not reaching the codebook"
+        );
+
+        // And it survives the round trip through the row's actual bytes:
+        // `write_identity` refuses a non-Geo concept, so a green read here
+        // also proves `osm_street_node` is registered in OGAR's concept table.
+        let row = build_row_notags(&rows[0]);
+        let (kind, _) = crate::identity::read_identity(&row)
+            .expect("a junction row must carry a readable identity facet");
+        assert_eq!(kind, crate::read::OSM_STREET_NODE);
     }
 
     #[test]

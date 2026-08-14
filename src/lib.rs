@@ -6,6 +6,7 @@
 //!
 //! [`NodeRow`]: lance_graph_contract::canonical_node::NodeRow
 
+pub mod access;
 pub mod capability;
 pub mod chains;
 pub mod cluster;
@@ -13,6 +14,7 @@ pub mod codebook;
 pub mod curve;
 pub mod fragment;
 pub mod geodesy;
+pub mod heading;
 pub mod identity;
 pub mod project;
 pub mod read;
