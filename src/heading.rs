@@ -142,7 +142,10 @@ mod tests {
         let pts = vec![(0.0, 0.0), (0.0, 100.0), (1.0, 100.0), (1.0, 0.5)];
         let class = bending_class(&pts);
         assert!(class <= 15, "class {class} must fit 4 bits");
-        assert!(class >= 10, "a near-U-turn should read as strongly bent, got {class}");
+        assert!(
+            class >= 10,
+            "a near-U-turn should read as strongly bent, got {class}"
+        );
     }
 
     #[test]
@@ -182,6 +185,9 @@ mod tests {
         // The claim this module exists to make cheap: EDGE_SLOTS edges of
         // (direction, bending) cost half of one 16-byte value slot, against
         // Signed360's 12 bytes for just TWO headings.
-        assert_eq!(std::mem::size_of::<u8>() * usize::from(crate::street::EDGE_SLOTS), 8);
+        assert_eq!(
+            std::mem::size_of::<u8>() * usize::from(crate::street::EDGE_SLOTS),
+            8
+        );
     }
 }

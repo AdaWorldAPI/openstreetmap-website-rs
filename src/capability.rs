@@ -283,7 +283,11 @@ mod tests {
         jk.identity_ordinal = Some(1);
         let mut named = build_row(&jk, &crate::tags::TagStore::default().resolve().unwrap());
         street::set_edge_names(&mut named, &[7, 7]);
-        assert_eq!(street_edges(&row, 7).count(), 0, "a tagged POI has no edges");
+        assert_eq!(
+            street_edges(&row, 7).count(),
+            0,
+            "a tagged POI has no edges"
+        );
         assert_eq!(street_edges(&named, 7).count(), 2);
 
         // Length: a real Berlin-scale segment, not a zero-length degenerate.

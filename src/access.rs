@@ -104,8 +104,11 @@ pub fn oneway_from_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) 
 /// router that cannot tell "closed" from "closed except to bikes" will route
 /// a cyclist the long way around a street they were allowed to use directly.
 #[must_use]
-pub fn bicycle_contraflow_from_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> bool {
-    tags.into_iter().any(|(k, v)| k == "oneway:bicycle" && v == "no")
+pub fn bicycle_contraflow_from_tags<'a>(
+    tags: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    tags.into_iter()
+        .any(|(k, v)| k == "oneway:bicycle" && v == "no")
 }
 
 /// Pack one edge's access byte.
@@ -118,6 +121,30 @@ pub fn pack_access(access: u8, oneway: u8, contraflow: bool) -> u8 {
 #[must_use]
 pub fn unpack_access(b: u8) -> (u8, u8, bool) {
     (b & 0b111, (b >> 3) & 0b11, (b >> 5) & 1 == 1)
+}
+
+/// One way's whole access byte, from its tags — the composition the bake
+/// writes into [`crate::street::EDGE_GEOMETRY_SLOT`]'s access half.
+///
+/// Exists so the producer has ONE call and the three readings cannot be
+/// combined differently in different places. The tag iterator is walked three
+/// times rather than once on purpose: each `*_from_tags` owns its own
+/// precedence rule (access has OSM's specificity convention, oneway does not),
+/// and fusing them into a single pass would mean re-implementing those rules
+/// here — the duplication this function exists to prevent.
+///
+/// A way with no access tags at all yields the permissive default, which is
+/// correct for OSM: absence means "not restricted", never "unknown".
+#[must_use]
+pub fn way_access_byte<'a, I>(tags: I) -> u8
+where
+    I: IntoIterator<Item = (&'a str, &'a str)> + Clone,
+{
+    pack_access(
+        access_from_tags(tags.clone()),
+        oneway_from_tags(tags.clone()),
+        bicycle_contraflow_from_tags(tags),
+    )
 }
 
 /// An 8×8 forbidden-transition bitmask for one junction: bit `from*8+to` set
@@ -178,7 +205,10 @@ mod tests {
         // MORE SPECIFIC tag wins over the blanket one, tag order in the way
         // notwithstanding (OSM tags are unordered key=value pairs).
         let mask = access_from_tags([("access", "private"), ("bicycle", "yes")]);
-        assert_eq!(mask, ACCESS_BIKE, "bicycle=yes must re-open after access=private");
+        assert_eq!(
+            mask, ACCESS_BIKE,
+            "bicycle=yes must re-open after access=private"
+        );
     }
 
     #[test]
@@ -235,7 +265,11 @@ mod tests {
     #[test]
     fn restriction_mask_out_of_range_slots_are_inert_not_a_panic() {
         let m = RestrictionMask::EMPTY.with_forbidden(9, 3);
-        assert_eq!(m, RestrictionMask::EMPTY, "an invalid write must not corrupt the mask");
+        assert_eq!(
+            m,
+            RestrictionMask::EMPTY,
+            "an invalid write must not corrupt the mask"
+        );
         assert!(!m.is_forbidden(9, 3));
     }
 
@@ -265,5 +299,56 @@ mod tests {
                 assert!(m.is_forbidden(from, to));
             }
         }
+    }
+
+    /// The producer's one call must carry all three readings — a composition
+    /// that silently dropped one would still return a plausible byte.
+    ///
+    /// Each case therefore differs from the permissive default in a DIFFERENT
+    /// field, so dropping any single `*_from_tags` call fails at least one.
+    #[test]
+    fn the_way_access_byte_carries_all_three_readings() {
+        // Untagged: permissive, and NOT zero — absence means "not restricted"
+        // in OSM, so a zero byte here would forbid everything by accident.
+        let (a, o, c) = unpack_access(way_access_byte([("highway", "residential")]));
+        assert_eq!(a, ACCESS_ALL, "an untagged way must not be closed");
+        assert_eq!(o, ONEWAY_NONE);
+        assert!(!c);
+
+        // Oneway only — access and contraflow must stay at their defaults.
+        let (a, o, c) = unpack_access(way_access_byte([
+            ("highway", "residential"),
+            ("oneway", "yes"),
+        ]));
+        assert_eq!(a, ACCESS_ALL);
+        assert_eq!(o, ONEWAY_FORWARD, "the oneway reading was dropped");
+        assert!(!c);
+
+        // Access only — the OSM specificity convention: closed EXCEPT bikes.
+        let (a, o, c) = unpack_access(way_access_byte([("access", "private"), ("bicycle", "yes")]));
+        assert_eq!(a, ACCESS_BIKE, "the access reading was dropped");
+        assert_eq!(o, ONEWAY_NONE);
+        assert!(!c);
+
+        // Contraflow only — the field a router needs to avoid sending a
+        // cyclist the long way round a street they may legally use.
+        let (a, o, c) = unpack_access(way_access_byte([
+            ("highway", "residential"),
+            ("oneway", "yes"),
+            ("oneway:bicycle", "no"),
+        ]));
+        assert_eq!(a, ACCESS_ALL);
+        assert_eq!(o, ONEWAY_FORWARD);
+        assert!(c, "the contraflow reading was dropped");
+
+        // All three at once, each non-default, so the packing cannot be
+        // satisfied by any two of them.
+        let byte = way_access_byte([
+            ("access", "private"),
+            ("bicycle", "yes"),
+            ("oneway", "-1"),
+            ("oneway:bicycle", "no"),
+        ]);
+        assert_eq!(unpack_access(byte), (ACCESS_BIKE, ONEWAY_BACKWARD, true));
     }
 }

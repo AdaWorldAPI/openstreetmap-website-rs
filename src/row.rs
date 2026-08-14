@@ -33,6 +33,29 @@ impl EdgeNames {
     }
 }
 
+/// Row-local per-edge ACCESS payload — the access half of
+/// [`street::EDGE_GEOMETRY_SLOT`]. Same fixed-size shape as [`EdgeNames`],
+/// for the same reason ([`Keyed`] stays `Copy`).
+///
+/// The heading half of that slot has **no counterpart here yet**: the bake
+/// does not produce bearings, because a bearing needs the junction's index
+/// within each way's chain and [`crate::read::Junction`] carries way ids
+/// alone. See `street::edge_heading`'s docs — an unwritten heading byte reads
+/// as `0`, which decodes to a REAL direction (north) rather than "absent",
+/// so no consumer may read that lane until the bake fills it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EdgeAccess {
+    pub bytes: [u8; street::EDGE_SLOTS as usize],
+    pub len: u8,
+}
+
+impl EdgeAccess {
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 /// Tag facets one row can carry: everything after the key, edges, identity and
 /// the reserved slope slot.
 ///
@@ -117,6 +140,10 @@ pub struct Keyed {
     /// slices, grouped back together by `(kind, ordinal)` on read. See
     /// [`junction_keyed`].
     pub edge_names: EdgeNames,
+    /// Per-edge access bytes for a junction row. `len == 0` on ordinary
+    /// rows. Paired with `edge_names` by SLOT INDEX — entry `i` of both
+    /// describes the same incident way.
+    pub edge_access: EdgeAccess,
 }
 
 /// Key a feature: TMS Morton at z=32 → four cascade tiers.
@@ -136,6 +163,7 @@ pub fn key_feature(f: &Feature) -> Keyed {
         identity: 0,
         tags: f.tags,
         edge_names: EdgeNames::default(),
+        edge_access: EdgeAccess::default(),
     }
 }
 
@@ -165,7 +193,7 @@ pub fn key_feature(f: &Feature) -> Keyed {
 /// resolve, nothing to look up, and no row occupying space for an all-zero
 /// payload that `edge_mask` would read as empty anyway.
 #[must_use]
-pub fn junction_keyed(j: &crate::read::Junction, names: &[u16]) -> Vec<Keyed> {
+pub fn junction_keyed(j: &crate::read::Junction, names: &[u16], access: &[u8]) -> Vec<Keyed> {
     if names.is_empty() {
         return Vec::new();
     }
@@ -186,17 +214,35 @@ pub fn junction_keyed(j: &crate::read::Junction, names: &[u16]) -> Vec<Keyed> {
         identity: 0,
         tags: TagSpan::default(),
         edge_names: EdgeNames::default(),
+        edge_access: EdgeAccess::default(),
     };
     let per = street::EDGE_SLOTS as usize;
     names
         .chunks(per)
-        .map(|chunk| {
+        .enumerate()
+        .map(|(ci, chunk)| {
             let mut ordinals = [0u16; street::EDGE_SLOTS as usize];
             ordinals[..chunk.len()].copy_from_slice(chunk);
+            // The access bytes chunk in LOCKSTEP with the names, so slot `i`
+            // of a continuation row still describes the same incident way.
+            // `access` may be SHORTER than `names` (a caller that has not
+            // resolved it): the missing tail stays `len`-excluded rather than
+            // being padded with a plausible-looking permissive byte.
+            let mut bytes = [0u8; street::EDGE_SLOTS as usize];
+            // `lo` is clamped to the slice length before it is ever used as a
+            // range start: `&access[8..8]` panics on an EMPTY slice even though
+            // the range is empty, so computing `take` alone is not enough.
+            let lo = (ci * per).min(access.len());
+            let take = (access.len() - lo).min(chunk.len());
+            bytes[..take].copy_from_slice(&access[lo..lo + take]);
             Keyed {
                 edge_names: EdgeNames {
                     ordinals,
                     len: chunk.len() as u8,
+                },
+                edge_access: EdgeAccess {
+                    bytes,
+                    len: take as u8,
                 },
                 ..base
             }
@@ -306,6 +352,13 @@ pub fn build_row(k: &Keyed, tags: &ResolvedTags) -> NodeRow {
                 crate::cluster::write_tag(&mut row, FIRST_TAG_SLOT + i, ordinal, key, value);
             debug_assert!(wrote, "tag ({key}, {value}) was refused for slot {i}");
         }
+    }
+    if k.edge_access.len > 0 {
+        // Access only — the heading half is deliberately NOT written: the bake
+        // does not produce bearings yet (see `EdgeAccess`'s docs). Passing an
+        // empty headings slice leaves those bytes zero rather than fabricating
+        // a direction.
+        street::set_edge_geometry(&mut row, &[], k.edge_access.as_slice());
     }
     if k.edge_names.len > 0 {
         // A junction row: no ordinary tags (checked above — `k.tags` is
@@ -695,14 +748,14 @@ mod tests {
         // Every incident way unnamed (NAME_NONE) is the common case — a
         // service-road junction. It must cost nothing, not a row of zeros.
         let j = junction_at(1, 13.4, 52.5);
-        assert!(junction_keyed(&j, &[]).is_empty());
+        assert!(junction_keyed(&j, &[], &[]).is_empty());
     }
 
     #[test]
     fn a_junction_within_the_edge_budget_produces_exactly_one_row() {
         let j = junction_at(2, 13.4, 52.5);
         let names = [7u16, 9, 7];
-        let rows = junction_keyed(&j, &names);
+        let rows = junction_keyed(&j, &names, &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].edge_names.as_slice(), &names[..]);
         // RE-PINNED: this asserted `OSM_NODE` until `osm_street_node` (0x0F0B)
@@ -728,11 +781,62 @@ mod tests {
     /// would collapse them to ONE ordinal, and nothing on disk would separate
     /// them — which is exactly the state that cost 1,084,213 false hits when
     /// a reader tried to tell them apart by slot occupancy instead.
+    /// Access reaches the ROW, in the same per-edge order as the names, and
+    /// survives a continuation split.
+    ///
+    /// Two-sided on the pairing: the two edges carry DIFFERENT access bytes,
+    /// so a writer that wrote one value to every slot, or paired them by the
+    /// wrong index, fails here rather than looking plausible.
+    #[test]
+    fn access_reaches_the_row_paired_with_the_names() {
+        let j = junction_at(9, 13.4, 52.5);
+        let open = crate::access::pack_access(
+            crate::access::ACCESS_ALL,
+            crate::access::ONEWAY_NONE,
+            false,
+        );
+        let bikes_only = crate::access::pack_access(
+            crate::access::ACCESS_BIKE,
+            crate::access::ONEWAY_FORWARD,
+            true,
+        );
+        let mut rows = junction_keyed(&j, &[7u16, 9], &[open, bikes_only]);
+        assert_eq!(rows.len(), 1);
+        // The identity facet must be written before the row carries readable
+        // edge lanes at all: `street::edge_access` gates on `is_street_node`,
+        // which reads that facet. Skipping this returns 0 from every accessor
+        // — which is what an unresolved row SHOULD look like, and why the
+        // first version of this test failed rather than passing vacuously.
+        resolve_identities(&mut rows).unwrap();
+
+        let row = build_row_notags(&rows[0]);
+        assert_eq!(street::edge_access(&row, 0), open);
+        assert_eq!(street::edge_access(&row, 1), bikes_only);
+        assert_ne!(open, bikes_only, "the fixture must distinguish the slots");
+        // The name lane is untouched by the access write.
+        assert_eq!(street::edge_name(&row, 0), 7);
+        assert_eq!(street::edge_name(&row, 1), 9);
+        // The heading half is NOT written by the bake yet — pinned so that
+        // when it starts being written, this test fails and is re-pinned
+        // deliberately rather than drifting.
+        assert_eq!(street::edge_heading(&row, 0), 0);
+    }
+
+    /// A caller with no resolved access must not get a fabricated permissive
+    /// byte: `len` excludes it instead.
+    #[test]
+    fn absent_access_is_excluded_not_padded() {
+        let j = junction_at(10, 13.4, 52.5);
+        let rows = junction_keyed(&j, &[7u16, 9], &[]);
+        assert_eq!(rows[0].edge_access.len, 0);
+        assert!(rows[0].edge_access.as_slice().is_empty());
+    }
+
     #[test]
     fn a_junction_row_is_a_street_node_not_a_plain_node() {
         let node_id = 4_242;
         let j = junction_at(node_id, 13.4, 52.5);
-        let mut rows = junction_keyed(&j, &[7u16, 9]);
+        let mut rows = junction_keyed(&j, &[7u16, 9], &[]);
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].entity_type,
@@ -770,13 +874,13 @@ mod tests {
         let j = junction_at(3, 13.4, 52.5);
         let at_bound: Vec<u16> = (1..=street::EDGE_SLOTS as u16).collect();
         assert_eq!(
-            junction_keyed(&j, &at_bound).len(),
+            junction_keyed(&j, &at_bound, &[]).len(),
             1,
             "a full bucket must not split"
         );
 
         let over: Vec<u16> = (1..=street::EDGE_SLOTS as u16 + 3).collect();
-        let mut rows = junction_keyed(&j, &over);
+        let mut rows = junction_keyed(&j, &over, &[]);
         assert_eq!(
             rows.len(),
             2,

@@ -16,7 +16,7 @@ use std::io::Write;
 
 use lance_graph_contract::identity_quad::IdentityCodebook;
 use osm_soa_bake::codebook::{write_books, Books, Header, SlabHasher};
-use osm_soa_bake::{read, row, street, tms};
+use osm_soa_bake::{access, read, row, street, tms};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -72,19 +72,26 @@ fn main() {
         .flat_map(|j| j.edge_ways.iter().copied())
         .collect();
     let mut way_name: HashMap<i64, String> = HashMap::with_capacity(referenced.len());
+    // The access byte rides the SAME join, for the same reason the name does:
+    // `features` is the only place a way's id is still paired with its
+    // TagSpan (junctions carry way ids alone). Resolving it in a second pass
+    // would re-walk `features` to rebuild a pairing this loop already holds.
+    let mut way_access: HashMap<i64, u8> = HashMap::with_capacity(referenced.len());
     for f in &features {
         if f.entity_type != read::OSM_WAY || !referenced.contains(&f.osm_id) {
             continue;
         }
-        for &pair in tags.span(f.tags) {
-            let Some((key, value)) = tags.text(pair) else {
-                continue;
-            };
-            if key == "name" {
-                way_name.insert(f.osm_id, value.to_string());
-                break;
-            }
+        // Collected once and reused: `way_access_byte` walks the tags three
+        // times (one per reading), and `tags.text` is a resolve per pair.
+        let kv: Vec<(&str, &str)> = tags
+            .span(f.tags)
+            .iter()
+            .filter_map(|&pair| tags.text(pair))
+            .collect();
+        if let Some((_, value)) = kv.iter().find(|(k, _)| *k == "name") {
+            way_name.insert(f.osm_id, (*value).to_string());
         }
+        way_access.insert(f.osm_id, access::way_access_byte(kv.iter().copied()));
     }
     let mut distinct_names: Vec<String> = way_name.values().cloned().collect();
     distinct_names.sort_unstable();
@@ -124,7 +131,14 @@ fn main() {
         if names.iter().all(|&n| n == street::NAME_NONE) {
             continue;
         }
-        junction_rows.extend(row::junction_keyed(j, &names));
+        // Access rides the same per-edge order as the names — both are
+        // indexed by position in `j.edge_ways`.
+        let acc: Vec<u8> = j
+            .edge_ways
+            .iter()
+            .map(|w| way_access.get(w).copied().unwrap_or(access::ACCESS_ALL))
+            .collect();
+        junction_rows.extend(row::junction_keyed(j, &names, &acc));
     }
     eprintln!(
         "labels resolved in {:.1}s ({} distinct names, digest {:016x}) -> {} junction rows          from {} junction nodes",

@@ -323,6 +323,7 @@ mod tests {
             identity: 0,
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
+            edge_access: Default::default(),
         });
         set_edge_names(&mut r, names);
         r
@@ -357,6 +358,7 @@ mod tests {
             identity: 0,
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
+            edge_access: Default::default(),
         });
         set_edge_names(&mut poi, &[11u16, 12, 13]);
 
@@ -387,7 +389,10 @@ mod tests {
         let headings: Vec<u8> = (1..=EDGE_SLOTS).map(|e| e * 3).collect();
         let access: Vec<u8> = (1..=EDGE_SLOTS).map(|e| e * 5).collect();
         set_edge_geometry(&mut r, &headings, &access);
-        set_turn_restrictions(&mut r, crate::access::RestrictionMask(0xDEAD_BEEF_1234_5678));
+        set_turn_restrictions(
+            &mut r,
+            crate::access::RestrictionMask(0xDEAD_BEEF_1234_5678),
+        );
 
         for e in 0..EDGE_SLOTS {
             assert_eq!(edge_heading(&r, e), (e + 1) * 3, "heading {e}");
@@ -413,6 +418,7 @@ mod tests {
             identity: 0,
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
+            edge_access: Default::default(),
         });
         // Bytes present in exactly the places a tagged row's first tag lands.
         set_edge_geometry(&mut poi, &[9; 8], &[9; 8]);
@@ -443,7 +449,11 @@ mod tests {
     /// spilling into the turn slot.
     #[test]
     fn both_edge_lanes_fill_exactly_one_slot() {
-        assert_eq!(EDGE_SLOTS as usize * 2, 16, "heading(8) + access(8) = one slot");
+        assert_eq!(
+            EDGE_SLOTS as usize * 2,
+            16,
+            "heading(8) + access(8) = one slot"
+        );
         assert_eq!(
             slot_offset(TURN_SLOT) - slot_offset(EDGE_GEOMETRY_SLOT),
             16,

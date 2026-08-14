@@ -14,11 +14,16 @@ fn bearing_deg(a: (f64, f64), b: (f64, f64)) -> f64 {
     // z32 TileXy is a uniform grid (no lat-dependent scale distortion at this
     // scale), so atan2 on raw coordinates gives a real compass bearing.
     // Screen/tile convention: y grows downward, so north is -y.
-    (b.0 - a.0).atan2(-(b.1 - a.1)).to_degrees().rem_euclid(360.0)
+    (b.0 - a.0)
+        .atan2(-(b.1 - a.1))
+        .to_degrees()
+        .rem_euclid(360.0)
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: heading_probe <chains>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: heading_probe <chains>");
     let bytes = std::fs::read(&path).expect("read chains");
     let chains = Chains::from_bytes(bytes).expect("parse chains");
 
@@ -30,11 +35,16 @@ fn main() {
     // Ordinals are sparse (not every index is populated); walk a wide range
     // and take what resolves, same pattern `parity` uses.
     for ordinal in 0..8_000_000u32 {
-        let Ok(Some(cells)) = chains.get(ordinal) else { continue };
+        let Ok(Some(cells)) = chains.get(ordinal) else {
+            continue;
+        };
         if cells.len() < 3 {
             continue;
         }
-        let pts: Vec<(f64, f64)> = cells.iter().map(|c| (f64::from(c.x), f64::from(c.y_xyz))).collect();
+        let pts: Vec<(f64, f64)> = cells
+            .iter()
+            .map(|c| (f64::from(c.x), f64::from(c.y_xyz)))
+            .collect();
         let bearing = bearing_deg(pts[0], pts[1]);
         let dir = exit_direction(bearing);
         let bend = bending_class(&pts);
@@ -61,7 +71,10 @@ fn main() {
     println!("\ndirection histogram (16 compass points):");
     for (d, c) in dir_hist.iter().enumerate() {
         if *c > 0 {
-            println!("  dir {d:>2} ({:>5.1}°): {c}", direction_to_bearing(d as u8));
+            println!(
+                "  dir {d:>2} ({:>5.1}°): {c}",
+                direction_to_bearing(d as u8)
+            );
         }
     }
     println!("\nbending histogram (0=straight .. 15=hairpin):");
