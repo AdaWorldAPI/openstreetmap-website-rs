@@ -98,9 +98,39 @@ const fn slot_offset(slot: usize) -> usize {
     slot * 16
 }
 
+/// Is this row a junction — i.e. do the edge lanes mean anything on it?
+///
+/// Reads the kind from the identity facet, which is the ONLY thing on disk
+/// that distinguishes a junction row from an ordinary node row: both are 512
+/// bytes, and before `osm_street_node` (`0x0F0B`) existed they were
+/// indistinguishable. See this module's docs for what that cost.
+#[must_use]
+pub fn is_street_node(row: &NodeRow) -> bool {
+    matches!(
+        crate::identity::read_identity(row),
+        Some((kind, _)) if kind == crate::read::OSM_STREET_NODE
+    )
+}
+
 /// The name ordinal on edge `slot` of this junction.
+///
+/// Returns [`NAME_NONE`] for any row that is not a junction — the gate lives
+/// here, in the accessor, rather than in a rule callers are asked to
+/// remember. Every other read in this module ([`edge_mask`], [`StreetDto`])
+/// funnels through it, so one check covers the surface.
 #[must_use]
 pub fn edge_name(row: &NodeRow, edge: u8) -> u16 {
+    if !is_street_node(row) {
+        return NAME_NONE;
+    }
+    edge_name_unchecked(row, edge)
+}
+
+/// [`edge_name`] without the per-edge kind check — for callers that have
+/// already established the row is a junction. Private on purpose: the gate is
+/// only reliable if the public surface cannot bypass it.
+#[inline]
+fn edge_name_unchecked(row: &NodeRow, edge: u8) -> u16 {
     if edge >= EDGE_SLOTS {
         return NAME_NONE;
     }
@@ -115,11 +145,14 @@ pub fn edge_name(row: &NodeRow, edge: u8) -> u16 {
 #[must_use]
 pub fn edge_mask(row: &NodeRow, name: u16) -> WideFieldMask {
     let mut m = WideFieldMask::EMPTY;
-    if name == NAME_NONE {
+    // Gate ONCE for the whole sweep, then read unchecked — the kind cannot
+    // change between edges of the same row, so re-parsing the identity facet
+    // eight times would be pure cost.
+    if name == NAME_NONE || !is_street_node(row) {
         return m;
     }
     for e in 0..EDGE_SLOTS {
-        if edge_name(row, e) == name {
+        if edge_name_unchecked(row, e) == name {
             m = m.with(e);
         }
     }
@@ -164,6 +197,101 @@ impl StreetDto {
     }
 }
 
+/// Value-local slot carrying per-edge **geometry + access**, one byte each.
+///
+/// The width is not a choice: [`crate::heading::pack_edge`] and
+/// [`crate::access::pack_access`] are each one byte per edge, so
+/// `EDGE_SLOTS` of both is `8 + 8 = 16` — exactly one slot, with no padding
+/// and nothing left over. Heading occupies bytes `0..8`, access `8..16`.
+///
+/// # Why this slot is safe now, and was not before
+///
+/// Value-local 2 is [`crate::row`]'s `FIRST_TAG_SLOT` — where an ORDINARY
+/// row's first tag lands, and the exact slot whose reuse measured 1,084,213
+/// false hits (see this module's docs). Two things changed:
+///
+/// 1. A junction row carries `TagSpan::default()` by construction, so the tag
+///    loop writes nothing here on the rows this layout applies to.
+/// 2. The row's kind is now on disk, and every reader here gates on it
+///    ([`is_street_node`]), so a tagged node's first tag can no longer be
+///    mistaken for edge data.
+///
+/// Point 2 is the load-bearing one. Point 1 was already true in the draft
+/// that produced the false hits — "junction rows have no tags" was correct
+/// about junction rows and said nothing about the other 1,084,213.
+///
+/// This is the canon's own "Tetris it across the slots": the same bytes carry
+/// different meanings under different classids, resolved by the ClassView
+/// rather than by which slots happen to look occupied.
+pub const EDGE_GEOMETRY_SLOT: usize = NAME_SLOT + 1;
+
+/// Value-local slot carrying the turn-restriction matrix — the 8x8
+/// `(from, to)` bitmask as a `u64` in bytes `0..8`.
+///
+/// The upper 8 bytes are **reserved, not free**: per the canon's
+/// RESERVE-DON'T-RECLAIM rule a zero region reads as *not consulted*, never
+/// as spare space a later feature may claim.
+pub const TURN_SLOT: usize = NAME_SLOT + 2;
+
+/// Per-edge packed `(direction, bending)` — see [`crate::heading`].
+///
+/// Zero for every edge of a row that is not a junction, and zero for an edge
+/// the bake has not written: `0` decodes to direction 0 / bending 0, which is
+/// why callers should treat absence via [`is_street_node`] plus the name lane
+/// rather than by testing this byte against zero.
+#[must_use]
+pub fn edge_heading(row: &NodeRow, edge: u8) -> u8 {
+    if edge >= EDGE_SLOTS || !is_street_node(row) {
+        return 0;
+    }
+    row.value[slot_offset(EDGE_GEOMETRY_SLOT) + edge as usize]
+}
+
+/// Per-edge packed `(access, oneway, contraflow)` — see [`crate::access`].
+#[must_use]
+pub fn edge_access(row: &NodeRow, edge: u8) -> u8 {
+    if edge >= EDGE_SLOTS || !is_street_node(row) {
+        return 0;
+    }
+    row.value[slot_offset(EDGE_GEOMETRY_SLOT) + EDGE_SLOTS as usize + edge as usize]
+}
+
+/// The junction's turn-restriction matrix, or an empty mask for a row that is
+/// not a junction. Empty means "nothing forbidden", the zero-fallback default.
+#[must_use]
+pub fn turn_restrictions(row: &NodeRow) -> crate::access::RestrictionMask {
+    if !is_street_node(row) {
+        return crate::access::RestrictionMask(0);
+    }
+    let o = slot_offset(TURN_SLOT);
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&row.value[o..o + 8]);
+    crate::access::RestrictionMask(u64::from_le_bytes(b))
+}
+
+/// Write the per-edge geometry + access lanes. Baker-side; kept beside the
+/// reads so the two cannot drift.
+///
+/// Takes both lanes together because they share one slot — writing them
+/// through separate calls would invite a caller to fill half of it and leave
+/// the other half reading as "all access denied, no bending".
+pub fn set_edge_geometry(row: &mut NodeRow, headings: &[u8], access: &[u8]) {
+    let base = slot_offset(EDGE_GEOMETRY_SLOT);
+    let n = EDGE_SLOTS as usize;
+    for (e, h) in headings.iter().take(n).enumerate() {
+        row.value[base + e] = *h;
+    }
+    for (e, a) in access.iter().take(n).enumerate() {
+        row.value[base + n + e] = *a;
+    }
+}
+
+/// Write the turn-restriction matrix. Baker-side.
+pub fn set_turn_restrictions(row: &mut NodeRow, mask: crate::access::RestrictionMask) {
+    let o = slot_offset(TURN_SLOT);
+    row.value[o..o + 8].copy_from_slice(&mask.0.to_le_bytes());
+}
+
 /// Write per-edge name ordinals into a row's name slot.
 ///
 /// Baker-side; kept here so the read and the write share one layout.
@@ -185,15 +313,142 @@ mod tests {
         let mut r = build_row_notags(&Keyed {
             morton: 42,
             tiers: tiers_of(42),
-            entity_type: crate::read::OSM_WAY,
+            // A REAL junction row: the kind the bake stamps, plus an ordinal
+            // so the identity facet is actually written. The previous helper
+            // used `OSM_WAY` with no ordinal — a row that cannot exist in a
+            // bake, and which only passed because nothing read the kind.
+            entity_type: crate::read::OSM_STREET_NODE,
             osm_id: 0,
-            identity_ordinal: None,
+            identity_ordinal: Some(1),
             identity: 0,
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
         });
         set_edge_names(&mut r, names);
         r
+    }
+
+    /// The edge lanes are readable ONLY on a row whose identity facet says
+    /// `osm_street_node`. This is the invariant that makes the rest of the
+    /// class-resolved layout safe to build on.
+    ///
+    /// Until `osm_street_node` (`0x0F0B`) existed, the name lane's only
+    /// protection was HIDING — it sat at the one slot the tag path never
+    /// writes, so a misdirected read found zeros. That is not a gate, it is a
+    /// vacancy, and the module docs above record what happened when a reader
+    /// tried the next slot along: **1,084,213 false hits** on real Berlin
+    /// data. Every new lane (bearing, turn matrix, access) needs slots past
+    /// that vacancy, so the protection has to become an actual check.
+    ///
+    /// It lives INSIDE the accessor on purpose. A documented "callers must
+    /// check the kind first" is a rule that holds until someone forgets;
+    /// `edge_name` refusing to answer for a non-junction row cannot be
+    /// forgotten.
+    #[test]
+    fn edge_lanes_are_mute_on_a_row_that_is_not_a_street_node() {
+        // A tagged POI, with bytes in the name slot — the shape a misdirected
+        // read would find. It must decode to nothing, not to eight streets.
+        let mut poi = build_row_notags(&Keyed {
+            morton: 42,
+            tiers: tiers_of(42),
+            entity_type: crate::read::OSM_NODE,
+            osm_id: 7,
+            identity_ordinal: Some(7),
+            identity: 0,
+            tags: crate::tags::TagSpan::default(),
+            edge_names: crate::row::EdgeNames::default(),
+        });
+        set_edge_names(&mut poi, &[11u16, 12, 13]);
+
+        assert!(!is_street_node(&poi), "an osm_node row is not a junction");
+        for e in 0..EDGE_SLOTS {
+            assert_eq!(
+                edge_name(&poi, e),
+                NAME_NONE,
+                "edge {e} must be mute on a non-junction row"
+            );
+        }
+        assert_eq!(edge_mask(&poi, 11).count(), 0);
+        assert!(StreetDto::at(&poi, 0).is_none());
+
+        // Two-sided: the identical bytes on a real junction row DO decode, so
+        // this test cannot pass by the lanes being broken for everyone.
+        let j = junction(&[11u16, 12, 13]);
+        assert!(is_street_node(&j));
+        assert_eq!(edge_name(&j, 0), 11);
+        assert_eq!(edge_mask(&j, 11).count(), 1);
+    }
+
+    /// The three lanes occupy disjoint bytes and survive each other — the
+    /// property that makes a shared slot safe rather than merely compact.
+    #[test]
+    fn the_edge_lanes_do_not_overwrite_one_another() {
+        let mut r = junction(&[11u16, 22, 33]);
+        let headings: Vec<u8> = (1..=EDGE_SLOTS).map(|e| e * 3).collect();
+        let access: Vec<u8> = (1..=EDGE_SLOTS).map(|e| e * 5).collect();
+        set_edge_geometry(&mut r, &headings, &access);
+        set_turn_restrictions(&mut r, crate::access::RestrictionMask(0xDEAD_BEEF_1234_5678));
+
+        for e in 0..EDGE_SLOTS {
+            assert_eq!(edge_heading(&r, e), (e + 1) * 3, "heading {e}");
+            assert_eq!(edge_access(&r, e), (e + 1) * 5, "access {e}");
+        }
+        assert_eq!(turn_restrictions(&r).0, 0xDEAD_BEEF_1234_5678);
+        // The name lane is untouched — the slot next door is a different slot.
+        assert_eq!(edge_name(&r, 0), 11);
+        assert_eq!(edge_name(&r, 1), 22);
+    }
+
+    /// The geometry slot is `FIRST_TAG_SLOT` — the one whose reuse measured
+    /// 1,084,213 false hits. It is safe here ONLY because readers gate on the
+    /// kind, so this pins the gate on the new lanes too, not just the names.
+    #[test]
+    fn the_new_lanes_are_also_mute_on_a_non_junction_row() {
+        let mut poi = build_row_notags(&Keyed {
+            morton: 42,
+            tiers: tiers_of(42),
+            entity_type: crate::read::OSM_NODE,
+            osm_id: 7,
+            identity_ordinal: Some(7),
+            identity: 0,
+            tags: crate::tags::TagSpan::default(),
+            edge_names: crate::row::EdgeNames::default(),
+        });
+        // Bytes present in exactly the places a tagged row's first tag lands.
+        set_edge_geometry(&mut poi, &[9; 8], &[9; 8]);
+        set_turn_restrictions(&mut poi, crate::access::RestrictionMask(u64::MAX));
+
+        for e in 0..EDGE_SLOTS {
+            assert_eq!(edge_heading(&poi, e), 0, "heading {e} must be mute");
+            assert_eq!(edge_access(&poi, e), 0, "access {e} must be mute");
+        }
+        assert_eq!(
+            turn_restrictions(&poi).0,
+            0,
+            "a non-junction row forbids nothing; an all-ones read would forbid every turn"
+        );
+
+        // Two-sided: identical bytes on a real junction DO decode.
+        let mut j = junction(&[11u16]);
+        set_edge_geometry(&mut j, &[9; 8], &[9; 8]);
+        set_turn_restrictions(&mut j, crate::access::RestrictionMask(u64::MAX));
+        assert_eq!(edge_heading(&j, 0), 9);
+        assert_eq!(edge_access(&j, 0), 9);
+        assert_eq!(turn_restrictions(&j).0, u64::MAX);
+    }
+
+    /// The packing is forced by arithmetic, not chosen: one byte per edge for
+    /// each lane means both fit one 16-byte slot exactly. If either widens,
+    /// this fails and the layout must be re-decided rather than silently
+    /// spilling into the turn slot.
+    #[test]
+    fn both_edge_lanes_fill_exactly_one_slot() {
+        assert_eq!(EDGE_SLOTS as usize * 2, 16, "heading(8) + access(8) = one slot");
+        assert_eq!(
+            slot_offset(TURN_SLOT) - slot_offset(EDGE_GEOMETRY_SLOT),
+            16,
+            "the turn slot must begin exactly where the geometry slot ends"
+        );
     }
 
     #[test]

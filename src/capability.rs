@@ -270,9 +270,20 @@ mod tests {
         assert!(project_fields(&row, &full, &empty).is_empty());
 
         // Street edges: an unnamed junction yields nothing; a named one does.
-        let mut named = row;
+        //
+        // The named row must be a REAL junction — `entity_type:
+        // OSM_STREET_NODE` plus an ordinal, so the identity facet is written.
+        // `street::edge_name` gates on that kind, and it must: `row` here is a
+        // tagged `osm_node`, and reading edge lanes off one of those is the
+        // 1,084,213-false-hit defect `street.rs` documents. This test
+        // previously wrote names onto the POI row itself and passed only
+        // because nothing checked the kind.
+        let mut jk = k;
+        jk.entity_type = crate::read::OSM_STREET_NODE;
+        jk.identity_ordinal = Some(1);
+        let mut named = build_row(&jk, &crate::tags::TagStore::default().resolve().unwrap());
         street::set_edge_names(&mut named, &[7, 7]);
-        assert_eq!(street_edges(&row, 7).count(), 0);
+        assert_eq!(street_edges(&row, 7).count(), 0, "a tagged POI has no edges");
         assert_eq!(street_edges(&named, 7).count(), 2);
 
         // Length: a real Berlin-scale segment, not a zero-length degenerate.
