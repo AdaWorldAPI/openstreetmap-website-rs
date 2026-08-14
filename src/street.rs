@@ -98,9 +98,39 @@ const fn slot_offset(slot: usize) -> usize {
     slot * 16
 }
 
+/// Is this row a junction — i.e. do the edge lanes mean anything on it?
+///
+/// Reads the kind from the identity facet, which is the ONLY thing on disk
+/// that distinguishes a junction row from an ordinary node row: both are 512
+/// bytes, and before `osm_street_node` (`0x0F0B`) existed they were
+/// indistinguishable. See this module's docs for what that cost.
+#[must_use]
+pub fn is_street_node(row: &NodeRow) -> bool {
+    matches!(
+        crate::identity::read_identity(row),
+        Some((kind, _)) if kind == crate::read::OSM_STREET_NODE
+    )
+}
+
 /// The name ordinal on edge `slot` of this junction.
+///
+/// Returns [`NAME_NONE`] for any row that is not a junction — the gate lives
+/// here, in the accessor, rather than in a rule callers are asked to
+/// remember. Every other read in this module ([`edge_mask`], [`StreetDto`])
+/// funnels through it, so one check covers the surface.
 #[must_use]
 pub fn edge_name(row: &NodeRow, edge: u8) -> u16 {
+    if !is_street_node(row) {
+        return NAME_NONE;
+    }
+    edge_name_unchecked(row, edge)
+}
+
+/// [`edge_name`] without the per-edge kind check — for callers that have
+/// already established the row is a junction. Private on purpose: the gate is
+/// only reliable if the public surface cannot bypass it.
+#[inline]
+fn edge_name_unchecked(row: &NodeRow, edge: u8) -> u16 {
     if edge >= EDGE_SLOTS {
         return NAME_NONE;
     }
@@ -115,11 +145,14 @@ pub fn edge_name(row: &NodeRow, edge: u8) -> u16 {
 #[must_use]
 pub fn edge_mask(row: &NodeRow, name: u16) -> WideFieldMask {
     let mut m = WideFieldMask::EMPTY;
-    if name == NAME_NONE {
+    // Gate ONCE for the whole sweep, then read unchecked — the kind cannot
+    // change between edges of the same row, so re-parsing the identity facet
+    // eight times would be pure cost.
+    if name == NAME_NONE || !is_street_node(row) {
         return m;
     }
     for e in 0..EDGE_SLOTS {
-        if edge_name(row, e) == name {
+        if edge_name_unchecked(row, e) == name {
             m = m.with(e);
         }
     }
@@ -185,15 +218,70 @@ mod tests {
         let mut r = build_row_notags(&Keyed {
             morton: 42,
             tiers: tiers_of(42),
-            entity_type: crate::read::OSM_WAY,
+            // A REAL junction row: the kind the bake stamps, plus an ordinal
+            // so the identity facet is actually written. The previous helper
+            // used `OSM_WAY` with no ordinal — a row that cannot exist in a
+            // bake, and which only passed because nothing read the kind.
+            entity_type: crate::read::OSM_STREET_NODE,
             osm_id: 0,
-            identity_ordinal: None,
+            identity_ordinal: Some(1),
             identity: 0,
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
         });
         set_edge_names(&mut r, names);
         r
+    }
+
+    /// The edge lanes are readable ONLY on a row whose identity facet says
+    /// `osm_street_node`. This is the invariant that makes the rest of the
+    /// class-resolved layout safe to build on.
+    ///
+    /// Until `osm_street_node` (`0x0F0B`) existed, the name lane's only
+    /// protection was HIDING — it sat at the one slot the tag path never
+    /// writes, so a misdirected read found zeros. That is not a gate, it is a
+    /// vacancy, and the module docs above record what happened when a reader
+    /// tried the next slot along: **1,084,213 false hits** on real Berlin
+    /// data. Every new lane (bearing, turn matrix, access) needs slots past
+    /// that vacancy, so the protection has to become an actual check.
+    ///
+    /// It lives INSIDE the accessor on purpose. A documented "callers must
+    /// check the kind first" is a rule that holds until someone forgets;
+    /// `edge_name` refusing to answer for a non-junction row cannot be
+    /// forgotten.
+    #[test]
+    fn edge_lanes_are_mute_on_a_row_that_is_not_a_street_node() {
+        // A tagged POI, with bytes in the name slot — the shape a misdirected
+        // read would find. It must decode to nothing, not to eight streets.
+        let mut poi = build_row_notags(&Keyed {
+            morton: 42,
+            tiers: tiers_of(42),
+            entity_type: crate::read::OSM_NODE,
+            osm_id: 7,
+            identity_ordinal: Some(7),
+            identity: 0,
+            tags: crate::tags::TagSpan::default(),
+            edge_names: crate::row::EdgeNames::default(),
+        });
+        set_edge_names(&mut poi, &[11u16, 12, 13]);
+
+        assert!(!is_street_node(&poi), "an osm_node row is not a junction");
+        for e in 0..EDGE_SLOTS {
+            assert_eq!(
+                edge_name(&poi, e),
+                NAME_NONE,
+                "edge {e} must be mute on a non-junction row"
+            );
+        }
+        assert_eq!(edge_mask(&poi, 11).count(), 0);
+        assert!(StreetDto::at(&poi, 0).is_none());
+
+        // Two-sided: the identical bytes on a real junction row DO decode, so
+        // this test cannot pass by the lanes being broken for everyone.
+        let j = junction(&[11u16, 12, 13]);
+        assert!(is_street_node(&j));
+        assert_eq!(edge_name(&j, 0), 11);
+        assert_eq!(edge_mask(&j, 11).count(), 1);
     }
 
     #[test]
