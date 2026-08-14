@@ -63,6 +63,26 @@ pub const OSM_NODE: u16 = class_ids::OSM_NODE;
 pub const OSM_WAY: u16 = class_ids::OSM_WAY;
 pub const OSM_RELATION: u16 = class_ids::OSM_RELATION;
 
+/// The one **derived** kind: a junction in the routable-way graph. OSM has no
+/// junction element, so unlike the three above this mirrors no Rails class —
+/// `ogar_osm::OSM_CONCEPTS` carries it with a deliberately empty rails list.
+///
+/// It exists as its own concept for a reason this bake measured the hard way.
+/// A junction row and an ordinary tagged node are the same 512 bytes with
+/// different payloads, and before this concept there was **no byte that told
+/// them apart**: `crate::street`'s module docs record a reader that tried the
+/// edge-name lane at value-local slot 2 and hit **1,084,213 false positives**
+/// on real Berlin data — one per tagged node, reinterpreting each node's first
+/// tag as eight raw name ordinals. The lane survives today only by hiding at
+/// slot 1, the last gap the tag path never writes, which does not scale: the
+/// route planner's bearing, turn-matrix and access lanes need several more
+/// slots and there is no second gap.
+///
+/// Stamping this as the identity facet's classid makes the layout
+/// **class-resolved** — a reader asks `read_identity` what the row IS instead
+/// of guessing from which slots look occupied.
+pub const OSM_STREET_NODE: u16 = class_ids::OSM_STREET_NODE;
+
 /// A turn restriction is an `osm_relation` like any other — the OGAR codebook
 /// (geo domain `0x0F`) has no `osm_turn_restriction` concept, and inventing an
 /// ordinal that no codebook mints would be exactly the fabricated-data defect
