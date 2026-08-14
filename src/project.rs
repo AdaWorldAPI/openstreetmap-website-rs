@@ -105,6 +105,7 @@ mod tests {
             identity: 0,
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
+            edge_access: Default::default(),
         })
     }
 

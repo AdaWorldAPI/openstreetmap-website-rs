@@ -24,7 +24,8 @@ use osmpbf::{Element, ElementReader};
 fn main() {
     let path = std::env::args().nth(1).expect("usage: access_probe <pbf>");
 
-    let (mut ways, mut open, mut oneway_fwd, mut oneway_back, mut contraflow) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut ways, mut open, mut oneway_fwd, mut oneway_back, mut contraflow) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut denied: HashMap<&'static str, u64> = HashMap::new();
 
     // via-node -> ways incident on it (routable ways only, same gate P12 used)
@@ -37,7 +38,9 @@ fn main() {
         .for_each(|el| match el {
             Element::Way(w) => {
                 let tags: Vec<(&str, &str)> = w.tags().collect();
-                let Some(_hw) = tags.iter().find(|(k, _)| *k == "highway") else { return };
+                let Some(_hw) = tags.iter().find(|(k, _)| *k == "highway") else {
+                    return;
+                };
                 ways += 1;
                 let access = access_from_tags(tags.iter().copied());
                 if access == ACCESS_ALL {
@@ -65,7 +68,9 @@ fn main() {
                 }
             }
             Element::Relation(r) => {
-                let is_restriction = r.tags().any(|(k, v)| k == "type" && v.starts_with("restriction"));
+                let is_restriction = r
+                    .tags()
+                    .any(|(k, v)| k == "type" && v.starts_with("restriction"));
                 if !is_restriction {
                     return;
                 }
@@ -91,7 +96,10 @@ fn main() {
         .expect("read pbf");
 
     println!("ways with highway tag: {ways}");
-    println!("fully open (no access denial): {open} ({:.1}%)", 100.0 * open as f64 / ways as f64);
+    println!(
+        "fully open (no access denial): {open} ({:.1}%)",
+        100.0 * open as f64 / ways as f64
+    );
     println!("access denials: {denied:?}");
     println!("oneway forward: {oneway_fwd}  backward: {oneway_back}");
     println!("bicycle contraflow (oneway:bicycle=no): {contraflow}");
@@ -104,7 +112,9 @@ fn main() {
     let mut per_via: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
     let mut incident_both = 0u64;
     for &(via, from, to) in &restrictions {
-        let Some(ways_here) = incident.get(&via) else { continue };
+        let Some(ways_here) = incident.get(&via) else {
+            continue;
+        };
         if ways_here.contains(&from) && ways_here.contains(&to) {
             incident_both += 1;
             per_via.entry(via).or_default().push((from, to));
@@ -153,6 +163,8 @@ fn main() {
         }
     }
     println!("junctions carrying >1 restriction: {multi_restriction_junctions}");
-    println!("max restrictions packed at one junction: {max_per_junction} (mask capacity: 64 pairs)");
+    println!(
+        "max restrictions packed at one junction: {max_per_junction} (mask capacity: 64 pairs)"
+    );
     println!("every real pair round-tripped through RestrictionMask correctly");
 }
