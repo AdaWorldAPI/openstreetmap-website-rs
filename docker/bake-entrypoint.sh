@@ -26,16 +26,25 @@ echo "==> workspace: $OUT"
 df -h "$WORK" | tail -1
 
 # ── 1. Source PBF ────────────────────────────────────────────────────────────
-# Reuse an existing download (a volume survives restarts, and the PBF is ~100 MB
-# from a third-party mirror — re-fetching it on every run is rude and slow).
-if [ -s "$PBF" ]; then
-    echo "==> reusing cached PBF: $PBF ($(du -h "$PBF" | cut -f1))"
-else
-    echo "==> downloading ${OSM_PBF_URL:?OSM_PBF_URL must be set}"
-    curl -fSL --retry 4 --retry-delay 2 -o "$PBF.part" "$OSM_PBF_URL"
-    mv "$PBF.part" "$PBF"
-    echo "    got $(du -h "$PBF" | cut -f1)"
+# THIS JOB DOES NOT DOWNLOAD. The PBF must already be on the volume.
+#
+# It used to `curl` the file from a third-party mirror on every run that found
+# no cached copy — and because this image exits when it finishes, anything that
+# runs it as a long-lived service restarts it forever, turning that into a
+# repeated automated pull from one shared egress IP. That is exactly the traffic
+# such a mirror blocks, and the bytes are not free either.
+#
+# There is nothing to fetch in any case: the sources already live in the shared
+# object store this job publishes to. Put the file on the volume before running
+# (or teach step 1 to read from that store) — do not reach out to a third party
+# from here.
+if [ ! -s "$PBF" ]; then
+    echo "error: no PBF at $PBF" >&2
+    echo "       this job does not download. Place the .osm.pbf there first —" >&2
+    echo "       the sources are in the object store, not on a public mirror." >&2
+    exit 1
 fi
+echo "==> using PBF: $PBF ($(du -h "$PBF" | cut -f1))"
 
 # ── 2. Bake ──────────────────────────────────────────────────────────────────
 # Writes $SLAB plus the $SLAB.books codebook sidecar. The sidecar is not
