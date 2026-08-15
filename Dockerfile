@@ -42,13 +42,15 @@ RUN cargo build --release --bin bake
 
 FROM debian:bookworm-slim
 
-# ca-certificates: HTTPS to both the PBF source and the object store.
+# ca-certificates: HTTPS to the object store. NOT to a PBF mirror — this image
+# no longer fetches one, and `curl` is gone with it, so there is nothing here
+# that can reach a third-party host.
 # python3-boto3: the upload. Chosen over the AWS CLI (a much larger install)
 # and over hand-rolled SigV4 in shell (signing a multipart upload correctly in
 # bash is not a thing worth owning here). boto3 also handles the custom
 # endpoint + multipart chunking for the ~1.2 GiB slab without extra flags.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl python3 python3-boto3 \
+        ca-certificates python3 python3-boto3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -61,7 +63,6 @@ RUN chmod +x /usr/local/bin/bake-entrypoint.sh
 # ~1.2 GiB and a container's writable layer is the wrong place for it.
 # Falls back to /tmp so the image is runnable without a volume.
 ENV RAILWAY_VOL=/volume01
-ENV OSM_PBF_URL=https://download.geofabrik.de/europe/germany/berlin-latest.osm.pbf
 ENV BAKE_NAME=berlin
 ENV BAKE_VERSION=osm-berlin-v0.1.0
 ENV BAKE_S3_PREFIX=q2/bakes
