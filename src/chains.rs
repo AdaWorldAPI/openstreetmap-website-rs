@@ -251,6 +251,22 @@ impl Chains {
         self.count == 0
     }
 
+    /// Every stored `(ordinal, raw record bytes)`, in ascending-ordinal
+    /// (storage) order — zero-copy, borrowing slices into the backing
+    /// buffer rather than decoding each chain into an owned `Vec<TileXy>`.
+    ///
+    /// This exists for bulk sidecar consumers (a boot-time Lance conversion)
+    /// that want the exact on-disk bytes to persist verbatim, not the
+    /// decoded geometry — [`Self::get`] remains the entry point for callers
+    /// that want a specific ordinal's decoded chain.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &[u8])> + '_ {
+        (0..self.count).map(move |i| {
+            let (ordinal, off, len) = self.entry(i);
+            let rec = &self.bytes[self.blob_at + off as usize..self.blob_at + (off + len) as usize];
+            (ordinal, rec)
+        })
+    }
+
     fn entry(&self, i: usize) -> (u32, u32, u32) {
         let at = self.index_at + i * 12;
         let b = &self.bytes[at..at + 12];
@@ -288,7 +304,17 @@ impl Chains {
     }
 }
 
-fn decode_chain(rec: &[u8]) -> Result<Vec<TileXy>, ChainError> {
+/// Decode one chain's raw record bytes (as yielded by [`Chains::iter`] or
+/// read back from a consumer's own copy of the bytes, e.g. after a
+/// round-trip through Lance) into its vertex chain. `Chains::get` uses this
+/// internally; it is `pub` so a consumer that stores raw records verbatim
+/// (never re-encoding) can decode them through the SAME function, per this
+/// module's "one codec, one place" doc rule.
+///
+/// # Errors
+///
+/// [`ChainError`] when `rec` is not a validly-encoded chain record.
+pub fn decode_chain(rec: &[u8]) -> Result<Vec<TileXy>, ChainError> {
     let mut pos = 0usize;
     let n = get_varint(rec, &mut pos)? as usize;
     let mut out = Vec::with_capacity(n);
@@ -354,6 +380,50 @@ mod tests {
         let r = ring();
         assert!(r.windows(2).any(|w| w[1].x < w[0].x));
         assert!(r.windows(2).any(|w| w[1].y_xyz < w[0].y_xyz));
+    }
+
+    /// `iter()` must yield every stored ordinal, in ascending order, and its
+    /// raw bytes must decode to EXACTLY what `get()` returns for that same
+    /// ordinal — proving the zero-copy slice and the decode-on-demand path
+    /// agree, not just that both compile.
+    #[test]
+    fn iter_yields_raw_records_that_decode_to_the_same_chains_as_get() {
+        let ch = Chains::from_bytes(build(vec![
+            (100, ring()),
+            (7, vec![c(5, 5)]),
+            (42, ring()),
+        ]))
+        .unwrap();
+
+        let collected: Vec<(u32, Vec<TileXy>)> = ch
+            .iter()
+            .map(|(ordinal, raw)| (ordinal, decode_chain(raw).expect("decode")))
+            .collect();
+
+        // Ascending storage order (write_chains sorts by ordinal), not
+        // insertion order — the anti-vacuity check that iter() isn't just
+        // echoing the input Vec unchanged.
+        assert_eq!(
+            collected.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![7, 42, 100]
+        );
+        assert_eq!(collected[0].1, vec![c(5, 5)]);
+        assert_eq!(collected[1].1, ring());
+        assert_eq!(collected[2].1, ring());
+
+        // And each entry matches get() for the same ordinal — two different
+        // read paths over the same stored bytes must agree.
+        for (ordinal, decoded) in &collected {
+            assert_eq!(ch.get(*ordinal).unwrap().as_ref(), Some(decoded));
+        }
+    }
+
+    /// Empty sidecar: iter() must yield nothing, not panic on an empty
+    /// index/blob.
+    #[test]
+    fn iter_on_an_empty_chains_file_yields_nothing() {
+        let ch = Chains::from_bytes(build(vec![])).unwrap();
+        assert_eq!(ch.iter().count(), 0);
     }
 
     #[test]
