@@ -49,7 +49,7 @@
 //! what the encoding does not yet carry.
 
 use crate::tms::TileXy;
-use std::io::Write;
+use std::io::{Read, Write};
 
 /// The sidecar magic. Versioned in the name so a layout change is a new magic,
 /// never a silent reinterpretation.
@@ -171,6 +171,38 @@ pub fn write_chains<W: Write>(
 }
 
 // ── decode ──────────────────────────────────────────────────────────
+
+/// Read ONLY the 24-byte header — magic, slab digest, chain count, blob
+/// length — from any [`Read`] source, without ever reading the index or blob
+/// that follow it.
+///
+/// This exists for a caller that needs to answer "is this sidecar valid for
+/// the current slab" (the same [`Chains::slab_digest`] check a full open
+/// implicitly enables) without paying [`Chains::from_bytes`]'s cost: that
+/// function takes an already fully-`std::fs::read`-in-memory `Vec<u8>`, so
+/// even a cheap parse afterward doesn't avoid the expensive READ. Passing a
+/// `File` handle here reads exactly 24 bytes off disk — `/api/osm/health` in
+/// the q2 cockpit is exactly the caller this is for: a status/diagnostic
+/// endpoint has no business eagerly loading the full resident sidecar the
+/// way the real serving path does.
+///
+/// # Errors
+///
+/// [`ChainError::Truncated`] if fewer than 24 bytes are available (a short
+/// read or any I/O failure — this format has no dedicated I/O-error variant,
+/// see the module's `ChainError`); [`ChainError::BadMagic`] on a magic
+/// mismatch.
+pub fn read_chains_header<R: Read>(r: &mut R) -> Result<(u64, usize, usize), ChainError> {
+    let mut buf = [0u8; 24];
+    r.read_exact(&mut buf).map_err(|_| ChainError::Truncated)?;
+    if buf[0..8] != MAGIC {
+        return Err(ChainError::BadMagic);
+    }
+    let slab_digest = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let count = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+    let blob_len = u32::from_le_bytes(buf[20..24].try_into().unwrap()) as usize;
+    Ok((slab_digest, count, blob_len))
+}
 
 /// The chains sidecar, opened for reading. Holds the raw bytes; a chain is
 /// decoded on demand ([`Self::get`]), so opening a 50 MB file does not
@@ -380,6 +412,64 @@ mod tests {
         let r = ring();
         assert!(r.windows(2).any(|w| w[1].x < w[0].x));
         assert!(r.windows(2).any(|w| w[1].y_xyz < w[0].y_xyz));
+    }
+
+    /// `read_chains_header` must agree with `Chains::from_bytes`'s own
+    /// parsed fields exactly, since a caller (q2's `/api/osm/health`) uses
+    /// it as a cheap stand-in for the same digest check a full open enables.
+    #[test]
+    fn read_chains_header_agrees_with_from_bytes() {
+        let buf = build(vec![(7, ring()), (100, vec![c(1, 1)])]);
+        let full = Chains::from_bytes(buf.clone()).expect("from_bytes");
+
+        let (slab_digest, count, blob_len) =
+            read_chains_header(&mut buf.as_slice()).expect("read_chains_header");
+        assert_eq!(slab_digest, full.slab_digest);
+        assert_eq!(count, full.len());
+        assert_eq!(blob_len, full.blob_len);
+    }
+
+    /// The falsifier that actually matters: it must succeed on a source
+    /// truncated right after the 24-byte header — proving it never reads the
+    /// index or blob. `Chains::from_bytes` on the same truncated bytes must
+    /// fail, which is the contrast that shows this is doing meaningfully
+    /// less work, not just wrapping the same call.
+    #[test]
+    fn read_chains_header_never_reads_past_the_header_even_when_truncated() {
+        let full = build(vec![(7, ring()), (100, vec![c(1, 1)])]);
+        assert!(full.len() > 24, "fixture must actually have body bytes past the header");
+        let truncated = &full[..24];
+
+        let (slab_digest, count, blob_len) =
+            read_chains_header(&mut { truncated }).expect("header-only read must succeed");
+        assert_eq!(slab_digest, 0xDEAD_BEEF_CAFE_F00D);
+        assert_eq!(count, 2);
+        assert!(blob_len > 0);
+
+        let err = Chains::from_bytes(truncated.to_vec()).expect_err("full parse must fail");
+        assert_eq!(err, ChainError::Truncated);
+    }
+
+    /// A short source (fewer than 24 bytes) must report `Truncated`, not
+    /// panic or silently return zeroed fields.
+    #[test]
+    fn read_chains_header_reports_truncated_on_a_too_short_source() {
+        let short = [0u8; 10];
+        let err = read_chains_header(&mut { &short[..] }).expect_err("must fail");
+        assert_eq!(err, ChainError::Truncated);
+    }
+
+    /// A malformed magic must be refused identically by both readers — the
+    /// cheap path must not accept what the full path would reject.
+    #[test]
+    fn read_chains_header_rejects_bad_magic_the_same_way_from_bytes_does() {
+        let mut buf = build(vec![(7, ring())]);
+        buf[0] = b'X';
+
+        let full_err = Chains::from_bytes(buf.clone()).expect_err("full parse must reject");
+        let header_err = read_chains_header(&mut buf.as_slice()).expect_err("header read must reject");
+        assert_eq!(full_err, ChainError::BadMagic);
+        assert_eq!(header_err, ChainError::BadMagic);
     }
 
     /// `iter()` must yield every stored ordinal, in ascending order, and its

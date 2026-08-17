@@ -352,14 +352,10 @@ fn read_book<R: Read>(r: &mut R, index: usize) -> Result<IdentityCodebook, BookE
     Ok(book)
 }
 
-/// Read the sidecar, verifying every book against its recorded digest.
-///
-/// # Errors
-///
-/// [`BookError`] — bad magic, a truncated record, a non-UTF-8 key, a book the
-/// codebook refuses, or (the one that matters) a digest that does not
-/// reproduce.
-pub fn read_books<R: Read>(r: &mut R) -> Result<(Header, Books), BookError> {
+/// The 40-byte header alone — magic, rows, slots_written, slab digest,
+/// rounding rule, book count. Shared by [`read_books`] (which continues past
+/// it into the 4 books) and [`read_books_header`] (which stops here).
+fn read_header<R: Read>(r: &mut R) -> Result<Header, BookError> {
     let magic = read_exact_n(r, MAGIC.len())?;
     if magic[..] != MAGIC[..] {
         let mut m = [0u8; 8];
@@ -375,21 +371,52 @@ pub fn read_books<R: Read>(r: &mut R) -> Result<(Header, Books), BookError> {
     if n as usize != BOOKS {
         return Err(BookError::BookCount(n));
     }
+    Ok(Header {
+        rows,
+        slots_written,
+        slab,
+        rounding,
+    })
+}
+
+/// Read the sidecar, verifying every book against its recorded digest.
+///
+/// # Errors
+///
+/// [`BookError`] — bad magic, a truncated record, a non-UTF-8 key, a book the
+/// codebook refuses, or (the one that matters) a digest that does not
+/// reproduce.
+pub fn read_books<R: Read>(r: &mut R) -> Result<(Header, Books), BookError> {
+    let header = read_header(r)?;
     let books = Books {
         identities: read_book(r, 0)?,
         tag_keys: read_book(r, 1)?,
         tag_values: read_book(r, 2)?,
         labels: read_book(r, 3)?,
     };
-    Ok((
-        Header {
-            rows,
-            slots_written,
-            slab,
-            rounding,
-        },
-        books,
-    ))
+    Ok((header, books))
+}
+
+/// Read ONLY the 40-byte header — magic, rows, slots_written, slab digest,
+/// rounding, book count — without touching the 4 codebooks that follow it.
+///
+/// This exists for a caller that needs to answer "is this codebook valid for
+/// the CURRENT slab" (the same [`Header::slab`] digest check [`read_books`]
+/// implicitly enables) without paying the cost of parsing potentially
+/// millions of book entries just to report a yes/no. `/api/osm/health` in
+/// the q2 cockpit is exactly that caller — a status/diagnostic endpoint has
+/// no business eagerly loading the full resident codebook the way the real
+/// serving path does.
+///
+/// # Errors
+///
+/// The same [`BookError`] variants [`read_books`] can return for a malformed
+/// header — magic, truncation, an unrecognised rounding rule, or a wrong
+/// book count. Never [`BookError::Digest`]/[`BookError::Utf8`]/
+/// [`BookError::Codebook`] — those can only occur while parsing book bodies,
+/// which this function never reads.
+pub fn read_books_header<R: Read>(r: &mut R) -> Result<Header, BookError> {
+    read_header(r)
 }
 
 /// Check a slab against the sidecar that claims it.
@@ -481,6 +508,61 @@ mod tests {
         assert_eq!(got.labels.len(), want.labels.len());
         assert!(got.labels.ordinal("Unter den Linden").is_some());
         assert!(got.labels.ordinal("Friedrichstraße").is_some());
+    }
+
+    /// `read_books_header` must agree with `read_books`'s header half exactly
+    /// — same struct, same values — since a caller (q2's `/api/osm/health`)
+    /// uses it as a cheap stand-in for the SAME digest check `open_books()`
+    /// performs, not a different one.
+    #[test]
+    fn read_books_header_agrees_with_read_books() {
+        let mut buf = Vec::new();
+        write_books(&mut buf, &head(), &sample()).expect("write");
+
+        let full = read_books(&mut buf.as_slice()).expect("read_books").0;
+        let header_only = read_books_header(&mut buf.as_slice()).expect("read_books_header");
+        assert_eq!(full, header_only);
+    }
+
+    /// The falsifier that actually matters for this function's reason to
+    /// exist: it must succeed on a buffer truncated right after the header —
+    /// proving it genuinely never reads into the book bodies. `read_books` on
+    /// the SAME truncated buffer must fail, which is the contrast that shows
+    /// `read_books_header` is doing meaningfully less work, not just wrapping
+    /// the same call.
+    #[test]
+    fn read_books_header_never_reads_past_the_header_even_when_the_books_are_truncated() {
+        let mut full = Vec::new();
+        write_books(&mut full, &head(), &sample()).expect("write");
+
+        // 8 (magic) + 8 (rows) + 8 (slots_written) + 8 (slab) + 4 (rounding)
+        // + 4 (book count) = 40 header bytes, computed independently of the
+        // writer's own field order so this test would fail if that order
+        // ever silently changed.
+        const HEADER_LEN: usize = 8 + 8 + 8 + 8 + 4 + 4;
+        let truncated = &full[..HEADER_LEN];
+
+        let header = read_books_header(&mut { truncated }).expect("header-only read must succeed");
+        assert_eq!(header, head());
+
+        let err = read_books(&mut { truncated }).expect_err("full read must fail on truncated books");
+        assert!(matches!(err, BookError::Truncated), "got {err:?}");
+    }
+
+    /// A malformed header (bad magic) must be refused identically by both
+    /// readers — the cheap path must not silently accept what the full path
+    /// would reject, which would make `/api/osm/health` report "valid" for a
+    /// sidecar that `open_books()` actually refuses.
+    #[test]
+    fn read_books_header_rejects_bad_magic_the_same_way_read_books_does() {
+        let mut buf = Vec::new();
+        write_books(&mut buf, &head(), &sample()).expect("write");
+        buf[0] = b'X'; // corrupt the magic
+
+        let full_err = read_books(&mut buf.as_slice()).expect_err("full read must reject");
+        let header_err = read_books_header(&mut buf.as_slice()).expect_err("header read must reject");
+        assert!(matches!(full_err, BookError::Magic(_)));
+        assert!(matches!(header_err, BookError::Magic(_)));
     }
 
     #[test]
