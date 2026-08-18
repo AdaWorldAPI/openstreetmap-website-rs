@@ -313,6 +313,27 @@ pub fn mean_cell(cells: &[TileXy]) -> Option<TileXy> {
     })
 }
 
+/// Compass bearing from `from` to `to`, degrees, `[0, 360)`, 0 = north,
+/// clockwise. `x` grows east; `y_xyz` grows south (the XYZ convention), so
+/// the north component is `-(to.y_xyz - from.y_xyz)`.
+///
+/// No latitude correction is needed: WebMercator (what [`lonlat_to_tile`]
+/// produces, and what every `TileXy` in this crate already is) is a
+/// **conformal** projection — it preserves local angles by construction, at
+/// any latitude. Computing the bearing directly from tile-space deltas is
+/// therefore exact for this purpose, not an approximation traded for
+/// simplicity.
+///
+/// `from == to` returns `0.0` (`atan2(0, 0)` is defined, not `NaN`) — a
+/// degenerate call, not an error; callers with a real direction to report
+/// will not pass two equal points.
+#[must_use]
+pub fn bearing_deg(from: TileXy, to: TileXy) -> f64 {
+    let east = f64::from(to.x) - f64::from(from.x);
+    let north = f64::from(from.y_xyz) - f64::from(to.y_xyz);
+    east.atan2(north).to_degrees().rem_euclid(360.0)
+}
+
 // ── The inverse: key → position ─────────────────────────────────────
 //
 // The key is only a *carrier* of the coordinate if the coordinate can be read
@@ -523,6 +544,161 @@ mod tests {
                 y_xyz: 2_147_483_648
             })
         );
+    }
+
+    #[test]
+    fn bearing_deg_matches_the_four_cardinal_directions() {
+        let o = TileXy {
+            x: 1000,
+            y_xyz: 1000,
+        };
+        // x grows east: due east is +x, 90°.
+        assert_eq!(
+            bearing_deg(
+                o,
+                TileXy {
+                    x: 1100,
+                    y_xyz: 1000
+                }
+            ),
+            90.0
+        );
+        // y_xyz grows south: due north is -y, 0°.
+        assert_eq!(
+            bearing_deg(
+                o,
+                TileXy {
+                    x: 1000,
+                    y_xyz: 900
+                }
+            ),
+            0.0
+        );
+        // Due south is +y, 180°.
+        assert_eq!(
+            bearing_deg(
+                o,
+                TileXy {
+                    x: 1000,
+                    y_xyz: 1100
+                }
+            ),
+            180.0
+        );
+        // Due west is -x, 270°.
+        assert_eq!(
+            bearing_deg(
+                o,
+                TileXy {
+                    x: 900,
+                    y_xyz: 1000
+                }
+            ),
+            270.0
+        );
+    }
+
+    #[test]
+    fn bearing_deg_matches_the_intercardinal_directions() {
+        let o = TileXy {
+            x: 1000,
+            y_xyz: 1000,
+        };
+        // Northeast: +x, -y.
+        assert_eq!(
+            bearing_deg(
+                o,
+                TileXy {
+                    x: 1100,
+                    y_xyz: 900
+                }
+            ),
+            45.0
+        );
+        // Southeast: +x, +y.
+        assert_eq!(
+            bearing_deg(
+                o,
+                TileXy {
+                    x: 1100,
+                    y_xyz: 1100
+                }
+            ),
+            135.0
+        );
+        // Southwest: -x, +y.
+        assert_eq!(
+            bearing_deg(
+                o,
+                TileXy {
+                    x: 900,
+                    y_xyz: 1100
+                }
+            ),
+            225.0
+        );
+        // Northwest: -x, -y.
+        assert_eq!(bearing_deg(o, TileXy { x: 900, y_xyz: 900 }), 315.0);
+    }
+
+    #[test]
+    fn bearing_deg_of_two_equal_points_is_zero_not_nan() {
+        // atan2(0, 0) is defined in Rust (0.0), never NaN — a degenerate
+        // call reports north rather than poisoning a downstream computation.
+        let a = TileXy { x: 42, y_xyz: 42 };
+        assert_eq!(bearing_deg(a, a), 0.0);
+    }
+
+    #[test]
+    fn bearing_deg_is_the_inverse_of_direction_it_feeds() {
+        // Round-trips through the crate's own quantizer, proving the two
+        // units (compass bearing here, exit_direction in `heading.rs`) agree
+        // on which way is "up" without importing heading.rs's own tests.
+        use crate::heading::exit_direction;
+        let o = TileXy {
+            x: 5000,
+            y_xyz: 5000,
+        };
+        assert_eq!(
+            exit_direction(bearing_deg(
+                o,
+                TileXy {
+                    x: 5000,
+                    y_xyz: 4000
+                }
+            )),
+            0
+        ); // N
+        assert_eq!(
+            exit_direction(bearing_deg(
+                o,
+                TileXy {
+                    x: 6000,
+                    y_xyz: 5000
+                }
+            )),
+            4
+        ); // E
+        assert_eq!(
+            exit_direction(bearing_deg(
+                o,
+                TileXy {
+                    x: 5000,
+                    y_xyz: 6000
+                }
+            )),
+            8
+        ); // S
+        assert_eq!(
+            exit_direction(bearing_deg(
+                o,
+                TileXy {
+                    x: 4000,
+                    y_xyz: 5000
+                }
+            )),
+            12
+        ); // W
     }
 
     #[test]

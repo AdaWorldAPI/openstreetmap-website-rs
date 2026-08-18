@@ -329,6 +329,14 @@ pub struct Junction {
     /// [`build_junctions`] walks them — never insertion order from the PBF
     /// reader, which is not guaranteed stable across reads.
     pub edge_ways: Vec<i64>,
+    /// `edge_ways[i]`'s position within THAT way's own node-ref list — the
+    /// piece a bearing needs and the reason it was not computed before this
+    /// field existed. Parallel to `edge_ways`, same index, same length. A way
+    /// touching this junction twice (the loop-back case in this struct's own
+    /// doc) gets two DIFFERENT indices here, one per occurrence — without
+    /// this, both occurrences would resolve to the same neighbor and report
+    /// an identical heading, silently wrong for the second one.
+    pub edge_way_index: Vec<usize>,
 }
 
 /// Build the junction set from a routable way's `(id, ordered node refs)`
@@ -345,22 +353,26 @@ fn build_junctions(routable_ways: &mut [(i64, Vec<i64>)], coords: &PosMap) -> Ve
         }
     }
 
-    let mut edges: HashMap<i64, Vec<i64>> = HashMap::new();
+    // (way_id, index-within-that-way's-node-list) per occurrence — the index
+    // is what lets a bearing be computed later (see `Junction::edge_way_index`'s
+    // doc for why the way id alone is not enough).
+    let mut edges: HashMap<i64, Vec<(i64, usize)>> = HashMap::new();
     for (way_id, nodes) in routable_ways.iter() {
-        for n in nodes {
+        for (idx, n) in nodes.iter().enumerate() {
             if occurrences.get(n).copied().unwrap_or(0) >= 2 {
-                edges.entry(*n).or_default().push(*way_id);
+                edges.entry(*n).or_default().push((*way_id, idx));
             }
         }
     }
 
     let mut out: Vec<Junction> = edges
         .into_iter()
-        .filter_map(|(node_id, edge_ways)| {
+        .filter_map(|(node_id, occs)| {
             coords.get(&node_id).map(|&cell| Junction {
                 node_id,
                 cell,
-                edge_ways,
+                edge_ways: occs.iter().map(|&(w, _)| w).collect(),
+                edge_way_index: occs.iter().map(|&(_, i)| i).collect(),
             })
         })
         .collect();
@@ -626,6 +638,11 @@ mod tests {
         assert_eq!(j.cell, cell(1, 0));
         // Deterministic order: ways sorted by id, so way 1 before way 2.
         assert_eq!(j.edge_ways, vec![1, 2]);
+        // Node 11 sits at index 1 in way 1's list (`[10, 11, 12]`) and index
+        // 1 in way 2's list (`[20, 11, 21]`) too — a coincidence of this
+        // fixture, not a rule; the loop-back test below is what proves the
+        // field discriminates when the indices genuinely differ.
+        assert_eq!(j.edge_way_index, vec![1, 1]);
 
         // ...and it's genuinely discriminating: nodes 10/12/20/21, each
         // touched by exactly one way exactly once, must NOT appear at all.
@@ -662,6 +679,12 @@ mod tests {
         // way 2 visits it once -> one entry of way id 2. Three total, not
         // deduplicated to "which ways touch this node".
         assert_eq!(j.edge_ways, vec![1, 1, 2]);
+        // The two way-1 occurrences must carry DIFFERENT indices (positions 1
+        // and 3 in `[1, 5, 2, 5]`) — this is the field a bearing needs: two
+        // identical indices here would make both occurrences resolve to the
+        // same neighbor and report an identical heading, which is exactly the
+        // silently-wrong outcome this field exists to prevent.
+        assert_eq!(j.edge_way_index, vec![1, 3, 0]);
 
         // Node 1 is touched once by way 1 and once by way 2 -> a genuine
         // 2-way junction too, one entry each.
@@ -670,6 +693,7 @@ mod tests {
             .find(|j| j.node_id == 1)
             .expect("node 1 also qualifies");
         assert_eq!(j1.edge_ways, vec![1, 2]);
+        assert_eq!(j1.edge_way_index, vec![0, 1]);
 
         // Node 2 is touched ONLY by way 1, at one position -> not a junction.
         assert!(!junctions.iter().any(|j| j.node_id == 2));

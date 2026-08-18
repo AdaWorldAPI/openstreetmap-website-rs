@@ -106,6 +106,7 @@ mod tests {
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
             edge_access: Default::default(),
+            edge_heading: Default::default(),
         })
     }
 

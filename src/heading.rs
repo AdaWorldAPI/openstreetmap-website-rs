@@ -94,6 +94,55 @@ pub fn unpack_edge(b: u8) -> (u8, u8) {
     (b & 0x0F, (b >> 4) & 0x0F)
 }
 
+/// Trailing points (including the junction itself) fed to the bearing +
+/// bending computation. Short on purpose: the bearing only needs the first
+/// step, and bending is meant to catch a LOCAL kink right at the junction —
+/// not classify the whole street's shape (that is `curve::fit_clothoid`'s
+/// job, on a different data path, not this one).
+const WINDOW: usize = 5;
+
+/// The packed `(direction, bending)` byte for the edge occurrence at
+/// `chain[index]`, computed from the way's OWN vertex chain — the piece
+/// `EdgeAccess`'s doc named as missing before `Junction::edge_way_index`
+/// existed to supply it.
+///
+/// `None` when `index` has no neighbor to point toward: out of range, or a
+/// one-node way (degenerate — should not occur for a real routable way, but
+/// this function does not assume it can't).
+///
+/// **Direction is forward-preferred.** If the way continues past `index` (a
+/// successor exists in ref order), the edge points that way; only when
+/// `index` is the way's LAST node does it point backward instead. This gives
+/// one well-defined heading per (way, junction) pair even when the junction
+/// is a mid-way point the way passes straight through — see `EdgeAccess`'s
+/// doc for why one edge slot encodes the way's own local tangent rather than
+/// a full bidirectional turn graph.
+#[must_use]
+pub fn edge_heading_from_chain(chain: &[crate::tms::TileXy], index: usize) -> Option<u8> {
+    let junction = *chain.get(index)?;
+    let window: Vec<crate::tms::TileXy> = if index + 1 < chain.len() {
+        chain[index..].iter().copied().take(WINDOW).collect()
+    } else if index > 0 {
+        chain[..=index].iter().rev().copied().take(WINDOW).collect()
+    } else {
+        return None; // the way has exactly one node — no direction exists
+    };
+    debug_assert_eq!(
+        window[0], junction,
+        "the window must start at the junction itself"
+    );
+    if window.len() < 2 {
+        return None;
+    }
+    let bearing = crate::tms::bearing_deg(window[0], window[1]);
+    let direction = exit_direction(bearing);
+    let pts: Vec<(f64, f64)> = window
+        .iter()
+        .map(|c| (f64::from(c.x), f64::from(c.y_xyz)))
+        .collect();
+    Some(pack_edge(direction, bending_class(&pts)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +238,70 @@ mod tests {
             std::mem::size_of::<u8>() * usize::from(crate::street::EDGE_SLOTS),
             8
         );
+    }
+
+    fn cell(x: u32, y: u32) -> crate::tms::TileXy {
+        crate::tms::TileXy { x, y_xyz: y }
+    }
+
+    #[test]
+    fn edge_heading_from_chain_points_forward_when_a_successor_exists() {
+        // Junction at index 0, way continues north (y decreases).
+        let chain = [cell(1000, 1000), cell(1000, 900), cell(1000, 800)];
+        let packed = edge_heading_from_chain(&chain, 0).expect("has a successor");
+        let (direction, bending) = unpack_edge(packed);
+        assert_eq!(direction, exit_direction(0.0), "due north");
+        assert_eq!(bending, 0, "a straight line bends 0");
+    }
+
+    #[test]
+    fn edge_heading_from_chain_points_backward_at_the_ways_last_node() {
+        // Junction is the LAST node (index 2); the only direction available
+        // is back toward the predecessor, due EAST from the junction's own
+        // perspective (the predecessor sits west of it).
+        let chain = [cell(800, 1000), cell(900, 1000), cell(1000, 1000)];
+        let packed = edge_heading_from_chain(&chain, 2).expect("has a predecessor");
+        let (direction, _) = unpack_edge(packed);
+        assert_eq!(
+            direction,
+            exit_direction(270.0),
+            "back toward the predecessor, due west"
+        );
+    }
+
+    #[test]
+    fn edge_heading_from_chain_a_mid_way_node_prefers_forward_over_backward() {
+        // Index 1 has BOTH a predecessor (west) and a successor (north) —
+        // forward-preferred means the successor wins, not the predecessor.
+        let chain = [cell(900, 1000), cell(1000, 1000), cell(1000, 900)];
+        let packed = edge_heading_from_chain(&chain, 1).expect("mid-way node");
+        let (direction, _) = unpack_edge(packed);
+        assert_eq!(
+            direction,
+            exit_direction(0.0),
+            "forward (north), not backward (east)"
+        );
+    }
+
+    #[test]
+    fn edge_heading_from_chain_is_none_for_a_single_node_way() {
+        assert_eq!(edge_heading_from_chain(&[cell(1000, 1000)], 0), None);
+    }
+
+    #[test]
+    fn edge_heading_from_chain_is_none_for_an_out_of_range_index() {
+        let chain = [cell(1000, 1000), cell(1000, 900)];
+        assert_eq!(edge_heading_from_chain(&chain, 5), None);
+    }
+
+    #[test]
+    fn edge_heading_from_chain_reports_a_real_bend_not_zero() {
+        // A sharp right-angle turn one step past the junction must NOT
+        // report bending 0 — the same falsifiability rule `bending_class`'s
+        // own tests already hold themselves to, applied at this seam too.
+        let chain = [cell(1000, 1000), cell(1000, 900), cell(1100, 900)];
+        let packed = edge_heading_from_chain(&chain, 0).expect("has a successor");
+        let (_, bending) = unpack_edge(packed);
+        assert!(bending > 0, "a right-angle kink must register as bent");
     }
 }
