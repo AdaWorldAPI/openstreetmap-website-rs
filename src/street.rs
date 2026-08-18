@@ -233,12 +233,16 @@ pub const EDGE_GEOMETRY_SLOT: usize = NAME_SLOT + 1;
 /// as spare space a later feature may claim.
 pub const TURN_SLOT: usize = NAME_SLOT + 2;
 
-/// Per-edge packed `(direction, bending)` — see [`crate::heading`].
+/// Per-edge packed `(direction, bending)` — see [`crate::heading`]. Written
+/// by the bake via `crate::heading::edge_heading_from_chain`, from the
+/// incident way's own vertex chain (`crate::read::Junction::edge_way_index`
+/// is what makes that possible — see that field's doc).
 ///
 /// Zero for every edge of a row that is not a junction, and zero for an edge
-/// the bake has not written: `0` decodes to direction 0 / bending 0, which is
-/// why callers should treat absence via [`is_street_node`] plus the name lane
-/// rather than by testing this byte against zero.
+/// slot past `len` (a junction with fewer than `EDGE_SLOTS` named edges):
+/// `0` decodes to direction 0 / bending 0, which is why callers should treat
+/// absence via [`is_street_node`] plus the name lane rather than by testing
+/// this byte against zero.
 #[must_use]
 pub fn edge_heading(row: &NodeRow, edge: u8) -> u8 {
     if edge >= EDGE_SLOTS || !is_street_node(row) {
@@ -324,6 +328,7 @@ mod tests {
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
             edge_access: Default::default(),
+            edge_heading: Default::default(),
         });
         set_edge_names(&mut r, names);
         r
@@ -359,6 +364,7 @@ mod tests {
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
             edge_access: Default::default(),
+            edge_heading: Default::default(),
         });
         set_edge_names(&mut poi, &[11u16, 12, 13]);
 
@@ -419,6 +425,7 @@ mod tests {
             tags: crate::tags::TagSpan::default(),
             edge_names: crate::row::EdgeNames::default(),
             edge_access: Default::default(),
+            edge_heading: Default::default(),
         });
         // Bytes present in exactly the places a tagged row's first tag lands.
         set_edge_geometry(&mut poi, &[9; 8], &[9; 8]);

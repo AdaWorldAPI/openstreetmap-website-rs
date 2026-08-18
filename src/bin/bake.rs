@@ -16,7 +16,7 @@ use std::io::Write;
 
 use lance_graph_contract::identity_quad::IdentityCodebook;
 use osm_soa_bake::codebook::{write_books, Books, Header, SlabHasher};
-use osm_soa_bake::{access, read, row, street, tms};
+use osm_soa_bake::{access, heading, read, row, street, tms};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -138,7 +138,26 @@ fn main() {
             .iter()
             .map(|w| way_access.get(w).copied().unwrap_or(access::ACCESS_ALL))
             .collect();
-        junction_rows.extend(row::junction_keyed(j, &names, &acc));
+        // Heading rides the SAME per-edge order too, but needs a SECOND
+        // per-edge value — `edge_way_index` — to resolve: the way id alone
+        // cannot say which of a way's (possibly several, on a loop-back)
+        // occurrences at this junction to compute a bearing from. `None`
+        // (a way missing from `way_chains`, or a genuinely single-node way —
+        // both should not occur on real routable data) falls back to byte 0,
+        // the same "unknown reads as north" convention every other unwritten
+        // heading in this bake already carries.
+        let hdg: Vec<u8> = j
+            .edge_ways
+            .iter()
+            .zip(&j.edge_way_index)
+            .map(|(w, &idx)| {
+                way_chains
+                    .get(w)
+                    .and_then(|chain| heading::edge_heading_from_chain(chain, idx))
+                    .unwrap_or(0)
+            })
+            .collect();
+        junction_rows.extend(row::junction_keyed(j, &names, &acc, &hdg));
     }
     eprintln!(
         "labels resolved in {:.1}s ({} distinct names, digest {:016x}) -> {} junction rows          from {} junction nodes",
@@ -300,6 +319,23 @@ fn main() {
         "junction rows         {:>12}  ({} distinct street names)",
         keyed.iter().filter(|k| k.edge_names.len > 0).count(),
         labels_len,
+    );
+    // A real end-to-end check, not just "the field compiles": if heading
+    // wiring silently regressed to all-zero (the exact failure mode this
+    // slot's own doc warns reads as a plausible-looking real direction, not
+    // an error), this line would report 0 against a nonzero edge-slot count
+    // rather than the bake finishing green with nothing to show for it.
+    let edge_slots_total: u64 = keyed.iter().map(|k| u64::from(k.edge_heading.len)).sum();
+    let edge_slots_headed: u64 = keyed
+        .iter()
+        .flat_map(|k| k.edge_heading.as_slice())
+        .filter(|&&b| b != 0)
+        .count() as u64;
+    println!(
+        "edge slots w/ heading  {:>11}  of {} total ({:.1}%)",
+        edge_slots_headed,
+        edge_slots_total,
+        100.0 * edge_slots_headed as f64 / edge_slots_total.max(1) as f64,
     );
     println!("facet slots written   {:>12}", slots_written);
     println!("slab digest           {:>12x}", hasher.finish());
