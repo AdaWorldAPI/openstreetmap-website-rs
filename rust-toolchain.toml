@@ -1,0 +1,32 @@
+[toolchain]
+channel = "1.98.1"
+# The pinned version is the `channel` line ABOVE — deliberately not restated in
+# this comment, so a future bump touches one line rather than prose that then
+# drifts. (Every sibling in this stack — lance-graph, OGAR, a2ui-rs,
+# tesseract-rs, MedCare-rs — follows this shape; MedCare-rs's own file records
+# what happens without it: its header claimed "1.95.0" while `channel` read
+# 1.97.1, two bumps stale.)
+#
+# This file did not exist before this pin, and its absence was not harmless.
+# Without it cargo falls back to whatever toolchain the machine happens to
+# default to, which is not a property of this repository at all. Measured here
+# before the file landed: the fallback was rustc 1.94.1, and the build FAILED —
+#
+#   ogar-osm@0.1.0 requires rustc 1.95
+#   ogar-vocab@0.1.0 requires rustc 1.95
+#
+# — so this repo did not build on this host, and would build differently on the
+# next one. That is the whole argument for the pin: not tidiness, reproducibility.
+#
+# 1.98.1 rather than the 1.95 those two crates demand: it is the version the
+# sibling repos this one path-depends on are pinned to, and it satisfies the
+# 1.95 floor a fortiori.
+#
+# Bump log (append one line per bump, newest last):
+#   (no file) → 1.98.1   2026-09-06: joined the workspace-wide 1.98.1 sweep.
+#                        Verified in THIS repo with `cargo clippy --all-targets
+#                        -- -D warnings`; see the PR for the measured result.
+#
+# Never auto-track `stable` — bump explicitly when a future version is reviewed
+# and this repo's clippy/fmt gates pass clean on it.
+components = ["rustfmt", "clippy"]
