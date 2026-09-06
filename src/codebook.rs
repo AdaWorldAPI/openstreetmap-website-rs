@@ -545,7 +545,8 @@ mod tests {
         let header = read_books_header(&mut { truncated }).expect("header-only read must succeed");
         assert_eq!(header, head());
 
-        let err = read_books(&mut { truncated }).expect_err("full read must fail on truncated books");
+        let err =
+            read_books(&mut { truncated }).expect_err("full read must fail on truncated books");
         assert!(matches!(err, BookError::Truncated), "got {err:?}");
     }
 
@@ -560,7 +561,8 @@ mod tests {
         buf[0] = b'X'; // corrupt the magic
 
         let full_err = read_books(&mut buf.as_slice()).expect_err("full read must reject");
-        let header_err = read_books_header(&mut buf.as_slice()).expect_err("header read must reject");
+        let header_err =
+            read_books_header(&mut buf.as_slice()).expect_err("header read must reject");
         assert!(matches!(full_err, BookError::Magic(_)));
         assert!(matches!(header_err, BookError::Magic(_)));
     }

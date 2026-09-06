@@ -437,7 +437,10 @@ mod tests {
     #[test]
     fn read_chains_header_never_reads_past_the_header_even_when_truncated() {
         let full = build(vec![(7, ring()), (100, vec![c(1, 1)])]);
-        assert!(full.len() > 24, "fixture must actually have body bytes past the header");
+        assert!(
+            full.len() > 24,
+            "fixture must actually have body bytes past the header"
+        );
         let truncated = &full[..24];
 
         let (slab_digest, count, blob_len) =
@@ -467,7 +470,8 @@ mod tests {
         buf[0] = b'X';
 
         let full_err = Chains::from_bytes(buf.clone()).expect_err("full parse must reject");
-        let header_err = read_chains_header(&mut buf.as_slice()).expect_err("header read must reject");
+        let header_err =
+            read_chains_header(&mut buf.as_slice()).expect_err("header read must reject");
         assert_eq!(full_err, ChainError::BadMagic);
         assert_eq!(header_err, ChainError::BadMagic);
     }
@@ -478,12 +482,8 @@ mod tests {
     /// agree, not just that both compile.
     #[test]
     fn iter_yields_raw_records_that_decode_to_the_same_chains_as_get() {
-        let ch = Chains::from_bytes(build(vec![
-            (100, ring()),
-            (7, vec![c(5, 5)]),
-            (42, ring()),
-        ]))
-        .unwrap();
+        let ch = Chains::from_bytes(build(vec![(100, ring()), (7, vec![c(5, 5)]), (42, ring())]))
+            .unwrap();
 
         let collected: Vec<(u32, Vec<TileXy>)> = ch
             .iter()
