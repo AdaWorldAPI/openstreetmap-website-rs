@@ -17,11 +17,11 @@
 # are git deps and resolve over the network. All three repos are public, so no
 # build secret is needed to fetch them.
 #
-# Toolchain: 1.98.1. `ogar-osm` / `ogar-vocab` declare `rust-version = 1.95`,
+# Toolchain: 1.98 (resolves to 1.98.1). `ogar-osm` / `ogar-vocab` declare `rust-version = 1.95`,
 # so the default 1.94 in some images fails resolution outright with a
 # "not supported by the following packages" error rather than a compile error.
 
-FROM rust:1.98.1-bookworm AS builder
+FROM rust:1.98-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
