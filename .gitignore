@@ -5,3 +5,6 @@
 # the private bucket), not in git — the repo already carries ~169 MB of PBFs.
 *.soa
 *.soa.gz
+
+# No tracked Cargo.lock (no pins, 2026-10-16): builds resolve the latest heads.
+Cargo.lock
